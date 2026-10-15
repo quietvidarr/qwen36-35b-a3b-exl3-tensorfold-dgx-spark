@@ -16,7 +16,7 @@ local/start.sh            # 127.0.0.1:8001; local/stop.sh. Optional first: local
 
 - Recipe base: souf, [sxuff/qwen38-flash-next-dgx-spark](https://github.com/sxuff/qwen38-flash-next-dgx-spark) (MIT, © 2026 souf): TensorFold base image, `vision-prefix-cache.patch`.
 - Weights: [yeasah/Qwen3.6-35B-A3B-exl3](https://huggingface.co/yeasah/Qwen3.6-35B-A3B-exl3).
-- Engine: [ashhart/TensorFold](https://github.com/ashhart/TensorFold) (Apache-2.0). TensorFold changes live in [quietvidarr/TensorFold-spark@3d7221cb](https://github.com/quietvidarr/TensorFold-spark/commit/3d7221cb416e665a63faf4f55d76f48d396b930c).
+- Engine: [ashhart/TensorFold](https://github.com/ashhart/TensorFold) (Apache-2.0). TensorFold changes: [quietvidarr/TensorFold-spark](https://github.com/quietvidarr/TensorFold-spark).
 
 ## Requirements
 
