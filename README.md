@@ -33,7 +33,10 @@ local/stop.sh
 | `CONTEXT` | auto | `262144` forces full window |
 | `MTP_DRAFTS` | 8 | 0 = no drafting; `TF_MTP_BY_N` per stream count |
 | `DEFAULT_TEMPERATURE/TOP_K/TOP_P/MIN_P` | generation_config | 1.0 / 20 / 0.95 |
-| `PROMPT_CACHE_DIR` | `~/recipes/prompt-cache/store` | SSD prompt cache, empty = off |
+| `PROMPT_CACHE_DIR` | `~/.cache/tensorfold-prompt-cache` | SSD prompt cache, shared with Flash; empty = off |
+| `FLASH_RECIPE` | `../qwen38-flash-next-dgx-spark` | Flash recipe clone (base image, update check) |
+| `HF_HUB_CACHE` | `~/.cache/huggingface/hub` | weights |
+| `TENSORFOLD_SRC_CACHE` | `.cache/tensorfold-src` | sources for `check-update.sh` |
 | `TF_LOCAL_IMAGE` | — | pin an older image (rollback) |
 
 | `TF_KEEP` | 3 | 8 | 12 | 16 |

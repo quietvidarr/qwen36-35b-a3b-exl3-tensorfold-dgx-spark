@@ -30,7 +30,7 @@ Incompatible: rebase our `01*.patch`, commit, re-check.
 | `serve_local.py` | Runs `tensorfold serve`; profiler `TF_PROFILE=1` |
 | `Dockerfile`, `build.sh` | `BASE_IMAGE` + patches + `serve_local.py`, offline; CPU import check |
 | `prebuild.sh` | Compile CUDA extensions on CPU (sm_121) |
-| `download.sh`, `verify_weights.py` | Resumable download, sha256-verified |
+| `download.sh`, `hf-download.sh`, `verify_weights.py` | Resumable download (curl), sha256-verified |
 | `image.sh` | "Update available" = image not built |
 | `check-update.sh`, `update.sh` | Safe update |
 | `router-entry.json` | Router models.json entry |
