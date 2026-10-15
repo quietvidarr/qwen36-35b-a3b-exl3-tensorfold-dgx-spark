@@ -2,16 +2,8 @@
     "Qwen3.6-35B-A3B-EXL3-6.00bpw-TensorFold": {
         "engine": "tensorfold",
         "aliases": [
-            "yeasah/Qwen3.6-35B-A3B-exl3",
-            "qwen3.6-35b-exl3",
-            "qwen3.6-35b-a3b-exl3",
-            "qwen36-35b-exl3",
-            "qwen36-exl3",
-            "qwen3.6-exl3",
-            "35b-exl3",
-            "35b-exl3-tensorfold",
-            "35b-tensorfold",
-            "35b-tf"
+            "35b-tf",
+            "35b-exl3"
         ],
         "dir": "~/recipes/qwen36-35b-a3b-exl3-tensorfold-dgx-spark",
         "repo": "https://github.com/quietvidarr/qwen36-35b-a3b-exl3-tensorfold-dgx-spark",
