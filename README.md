@@ -2,15 +2,10 @@
 
 Qwen3.6-35B-A3B in EXL3, served by TensorFold 0.6.5 on one GB10. OpenAI API on 127.0.0.1:8001.
 
-## Quick start
+## Install
 
-```bash
-export GH_TOKEN=<token>   # while the TensorFold fork is private
-(cd ../qwen38-flash-next-dgx-spark && local/build.sh)   # Flash recipe, sibling clone: makes the base image
-local/download.sh         # weights, resumable, sha256-verified
-local/build.sh            # base image + TensorFold fork at the pinned commit
-local/start.sh            # 127.0.0.1:8001; local/stop.sh. Optional first: local/prebuild.sh
-```
+Install and run through [spark-serving](https://github.com/quietvidarr/spark-serving#setup)'s model router. It installs the Flash recipe and its image first.
+The router calls `local/` internally.
 
 ## Credits
 
@@ -21,7 +16,7 @@ local/start.sh            # 127.0.0.1:8001; local/stop.sh. Optional first: local
 ## Requirements
 
 - DGX Spark (GB10, 128 GB), Docker with GPU.
-- The Flash recipe ([qwen38-flash-next-dgx-spark](https://github.com/quietvidarr/qwen38-flash-next-dgx-spark), branch `local-patches`) cloned next to this one (else `FLASH_RECIPE`); its `local/build.sh` makes the base image `qwen38-flash-next-tensorfold:609ca419`.
+- The Flash recipe ([qwen38-flash-next-dgx-spark](https://github.com/quietvidarr/qwen38-flash-next-dgx-spark)) next to this one (else `FLASH_RECIPE`), for the base image. The router installs it.
 - ~27 GB disk for weights.
 
 ## Config (`.env` overrides `local/config.sh`)
@@ -66,4 +61,4 @@ Switch: `local/pin-weights.sh 5.00bpw && local/download.sh`.
 - Text only: no vision path for this family in TensorFold 0.6.5.
 - bf16 KV only.
 - First start compiles kernels: a few minutes.
-- Update: `local/check-update.sh` then `local/update.sh`. Never `git pull`. See [LOCAL_CHANGES.md](LOCAL_CHANGES.md).
+- Update: the router's `/router/update` (checks compatibility first). Never `git pull`. See [LOCAL_CHANGES.md](LOCAL_CHANGES.md).
