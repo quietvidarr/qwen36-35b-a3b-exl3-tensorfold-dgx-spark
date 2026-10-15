@@ -40,7 +40,7 @@ source "$RECIPE_DIR/local/pins.env"
 # Prompt cache on disk (patches 0006 + 0104). Empty PROMPT_CACHE_DIR turns it off.
 : "${PROMPT_CACHE_DIR:=${XDG_CACHE_HOME:-$HOME/.cache}/tensorfold-prompt-cache}"   # shared with the Flash recipe; budgets are global
 : "${TF_POINTS_LAST:=all}"                      # states at EVERY message start (patch 0010; 3: the last 3; 0: upstream)
-: "${TF_POINTS_GAP:=256}"                       # with all: starts before the last 3 at least this far apart (256 = every one; 1024 = cheaper cold prefill of long histories)
+: "${TF_POINTS_GAP:=256}"                       # with all: starts before the last 3 at least this far apart (256 = every one; larger only keeps fewer old points, no prefill cost)
 : "${TF_PROMPT_CACHE_GIB:=100}"                 # normal points: this many GiB, least recently used out first
 : "${TF_PROMPT_CACHE_TTL_H:=72}"                # ... and each deleted this many hours after it was saved
 : "${TF_PROMPT_CACHE_PINNED_GIB:=50}"           # pinned points (prompt heads many conversations start with)

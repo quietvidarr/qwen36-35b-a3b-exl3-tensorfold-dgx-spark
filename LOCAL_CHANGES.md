@@ -5,7 +5,7 @@ No upstream recipe. Built on:
 | What | From | Pinned in |
 |---|---|---|
 | Image `qwen38-flash-next-tensorfold:609ca419` | Flash recipe (souf's `scripts/build_tensorfold.sh`) | `local/pins.env` `BASE_IMAGE`, `TENSORFOLD_REV` |
-| TensorFold source | [quietvidarr/TensorFold-spark@3d7221cb](https://github.com/quietvidarr/TensorFold-spark/commit/3d7221cb416e665a63faf4f55d76f48d396b930c) (both models; same commit as the Flash recipe) | `local/pins.env` `TENSORFOLD_FORK_REV` |
+| TensorFold source | [quietvidarr/TensorFold-spark@f92a45ee](https://github.com/quietvidarr/TensorFold-spark/commit/f92a45ee049ab627d0d3260443a63010d3221ea7) (both models; same commit as the Flash recipe) | `local/pins.env` `TENSORFOLD_FORK_REV` |
 | Weights | `yeasah/Qwen3.6-35B-A3B-exl3` `6.00bpw` | `local/pins.env`, `local/manifest.json` |
 
 ## Update
@@ -36,7 +36,7 @@ Incompatible: fix the fork (`spark`), pin the commit in both recipes, re-check.
 
 ## TensorFold changes
 
-TensorFold changes live in [quietvidarr/TensorFold-spark@3d7221cb](https://github.com/quietvidarr/TensorFold-spark/commit/3d7221cb416e665a63faf4f55d76f48d396b930c). Numbers = the former patch files; details in its `CHANGES.md`.
+TensorFold changes live in [quietvidarr/TensorFold-spark@f92a45ee](https://github.com/quietvidarr/TensorFold-spark/commit/f92a45ee049ab627d0d3260443a63010d3221ea7). Numbers = the former patch files; details in its `CHANGES.md`.
 
 | # | Change |
 |---|---|
@@ -52,6 +52,7 @@ TensorFold changes live in [quietvidarr/TensorFold-spark@3d7221cb](https://githu
 | 0113 | One read-back per draft level; `MTP_DRAFTS=8` + `TF_MTP_BY_N` |
 | 0114-0124 | Decode kernels: 32-row linear, GDN defer, graphs per rows, router tiles, MoE combine, grouped experts |
 | 0125 | Short prompt pieces on the fp16 prompt path: exact resume 8/8 (was 6-7/8) |
+| 0126 | Prompt-cache points inside one prefill pass (cold 44-message prompt was +36%); graphs capture `thread_local` |
 
 Untouched: Flash Next path (`qwen4_exp`), 27B path, other families.
 Rollback: `TF_LOCAL_IMAGE=<older tag>` in `.env`.
