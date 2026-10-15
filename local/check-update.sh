@@ -4,14 +4,14 @@
 #      pin) against ours (local/pins.env);
 #   2. the Flash recipe's local TensorFold patches (its local/patches/tensorfold/00*.patch) against our copies;
 #   3. our whole patch stack (Flash's upstream patches, its local ones, then our 01*.patch) on the TensorFold revision
-#      the Flash recipe now pins, in a scratch tree (TensorFold source cached in ~/recipes/.cache/tensorfold-src/<rev>);
+#      the Flash recipe now pins, in a scratch tree (TensorFold source cached in .cache/tensorfold-src/<rev>);
 #   4. the weights: the HF branch's newest revision against our pin.
 # Exit 0 = up to date or compatible (local/update.sh can apply it), 3 = incompatible (do not update; adapt our
 # 01*.patch as LOCAL_CHANGES.md says), 1 = the check itself failed (network, missing Flash recipe).
 set -uo pipefail
 source "$(dirname "$0")/config.sh"
 cd "$RECIPE_DIR"
-SRC_CACHE=~/recipes/.cache/tensorfold-src
+SRC_CACHE="${TENSORFOLD_SRC_CACHE:-$RECIPE_DIR/.cache/tensorfold-src}"
 F="$FLASH_RECIPE"
 bad=(); warn=()
 fail() { bad+=("$1"); echo "  INCOMPATIBLE: $1"; }
