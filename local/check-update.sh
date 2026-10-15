@@ -31,7 +31,7 @@ echo "== 2. fork: the Flash recipe's TensorFold-spark commit"
 if [ "$F_FORK_REV" = "$TENSORFOLD_FORK_REV" ]; then echo "  same: $TENSORFOLD_FORK_REV"
 else
   SRC="$(local/tensorfold-src.sh "$F_FORK_REV")" && local/tensorfold-src.sh >/dev/null \
-    || { echo "  could not fetch the fork (network or GH_TOKEN?)"; exit 1; }
+    || { echo "  could not fetch the fork (network?)"; exit 1; }
   git -C "$SRC" merge-base --is-ancestor "$TENSORFOLD_FORK_REV" "$F_FORK_REV" \
     && note "fork moves $TENSORFOLD_FORK_REV -> $F_FORK_REV" \
     || fail "the Flash recipe's fork commit $F_FORK_REV does not contain ours ($TENSORFOLD_FORK_REV)"

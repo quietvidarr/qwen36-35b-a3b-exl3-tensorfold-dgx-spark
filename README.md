@@ -36,7 +36,7 @@ local/start.sh            # 127.0.0.1:8001; local/stop.sh. Optional first: local
 | `PROMPT_CACHE_DIR` | `~/.cache/tensorfold-prompt-cache` | SSD prompt cache, shared with Flash; empty = off |
 | `FLASH_RECIPE` | `../qwen38-flash-next-dgx-spark` | Flash recipe clone (base image, update check) |
 | `HF_HUB_CACHE` | `~/.cache/huggingface/hub` | weights |
-| `TENSORFOLD_SRC` | `.cache/TensorFold-spark` | fork clone used by `build.sh`; `GH_TOKEN` while the fork is private |
+| `TENSORFOLD_SRC` | `.cache/TensorFold-spark` | fork clone used by the image build |
 | `TF_LOCAL_IMAGE` | — | pin an older image (rollback) |
 
 | `TF_KEEP` | 3 | 8 | 12 | 16 |

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build our image: BASE_IMAGE (local/pins.env; built by the Flash recipe's local/build.sh, never pulled here) with
-# TensorFold from our fork at the pinned commit (local/tensorfold-src.sh: needs the network once; private fork:
-# GH_TOKEN) and our serve wrapper. The docker build itself is offline. Prints the image tag on its last line.
+# TensorFold from our fork at the pinned commit (local/tensorfold-src.sh: needs the network once) and our serve
+# wrapper. The docker build itself is offline. Prints the image tag on its last line.
 #   local/build.sh          build what is missing
 #   local/build.sh --force  rebuild our layer even if the tag exists
 set -euo pipefail
