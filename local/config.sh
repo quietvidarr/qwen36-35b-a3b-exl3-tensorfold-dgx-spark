@@ -37,8 +37,8 @@ source "$RECIPE_DIR/local/pins.env"
 : "${TF_PROFILE_TRACE:=0}"                      # 1: the profiler also writes a kernel timeline (.json)
 : "${MEMORY_LIMIT:=112g}"                      # container cap (no swap), as the Flash recipe
 
-# Prompt cache on disk (patches 0006 + 0104, ~/recipes/prompt-cache/README.md). Empty PROMPT_CACHE_DIR turns it off.
-: "${PROMPT_CACHE_DIR:=$HOME/recipes/prompt-cache/store}"   # shared with the Flash recipe; budgets are global
+# Prompt cache on disk (patches 0006 + 0104). Empty PROMPT_CACHE_DIR turns it off.
+: "${PROMPT_CACHE_DIR:=${XDG_CACHE_HOME:-$HOME/.cache}/tensorfold-prompt-cache}"   # shared with the Flash recipe; budgets are global
 : "${TF_POINTS_LAST:=all}"                      # states at EVERY message start (patch 0010; 3: the last 3; 0: upstream)
 : "${TF_POINTS_GAP:=256}"                       # with all: starts before the last 3 at least this far apart (256 = every one; 1024 = cheaper cold prefill of long histories)
 : "${TF_PROMPT_CACHE_GIB:=100}"                 # normal points: this many GiB, least recently used out first
