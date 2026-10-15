@@ -1,0 +1,242 @@
+From 4c8c514bd003fcf73ff029a0b7f1f11c7bb4a9e6 Mon Sep 17 00:00:00 2001
+From: quietvidarr <343052645+quietvidarr@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 10:55:54 +0200
+Subject: [PATCH] local 0107: qwen36 prompt cache: states wait in GPU memory
+ instead of being dropped, keep_rank eviction
+
+---
+ .../families/qwen3_5_moe/cuda/disk_points.py  | 29 +++++++++--
+ .../families/qwen3_5_moe/cuda/multi.py        | 48 ++++++++++++-------
+ tests/test_qwen36_prompt_store.py             | 47 ++++++++++++++++++
+ 3 files changed, 104 insertions(+), 20 deletions(-)
+
+diff --git a/src/tensorfold/families/qwen3_5_moe/cuda/disk_points.py b/src/tensorfold/families/qwen3_5_moe/cuda/disk_points.py
+index 6e2ea2c..fb18d6b 100644
+--- a/src/tensorfold/families/qwen3_5_moe/cuda/disk_points.py
++++ b/src/tensorfold/families/qwen3_5_moe/cuda/disk_points.py
+@@ -60,8 +60,10 @@ def open_store(dec):
+     return ps.open_store(geometry(dec.w), idle=lambda: not dec.streams and not dec.filling)
+ 
+ 
+-def capture(dec, ids: list[int], state, snap) -> None:
+-    """Queue a kept entry for the store (its new blocks and the rows past them), unless it is there already."""
++def capture(dec, ids: list[int], state, snap, *, force: bool = False) -> None:
++    """Queue a kept entry for the store (its new blocks and the rows past them), unless it is there already. While the
++    queue is full (patch 0107) the entry waits in GPU memory (``dec.unsaved``; its rows are views commits never write
++    and its recurrent states are copies, so holding it keeps it intact) until ``retry`` finds room."""
+ 
+     store = dec.store
+     n = len(ids)
+@@ -72,6 +74,11 @@ def capture(dec, ids: list[int], state, snap) -> None:
+     k = pre.point(n)
+     if store.has_point(k):
+         return
++    if not force and store.full():
++        if all(u[0] != k for u in dec.unsaved):
++            dec.unsaved.append((k, list(ids), state, snap))
++            store.defer(k, n)
++        return
+     cp = store.copier
+     full = min((n - 1) // B, mc.pos // B)
+     order = [pre.block(j) for j in range(full)]
+@@ -82,7 +89,23 @@ def capture(dec, ids: list[int], state, snap) -> None:
+              "rec": [cp.host(r) for r in state.rec if r is not None],
+              "conv": [cp.host(c) for c in state.conv if c is not None], "held": cp.host(held)}
+     store.put(k, n, ids, point, blocks, order, _bytes(point) + sum(_bytes(b) for b in blocks.values()),
+-              ready=cp.done())
++              ready=cp.done(), forced=force and store.full())
++
++
++def retry(dec, *, force: bool = False) -> None:
++    """Copy the waiting entries, oldest first, while the queue has room (all of them: ``force``)."""
++
++    for u in list(dec.unsaved):
++        if not force and dec.store.full():
++            return
++        dec.unsaved = [x for x in dec.unsaved if x is not u]
++        try:
++            capture(dec, u[1], u[2], u[3], force=force)
++        except Exception as exc:  # noqa: BLE001 - the disk copy never stops a request
++            dec.store.stats["errors"] += 1
++            print(f"[prompt-cache] save failed: {type(exc).__name__}: {exc}", flush=True)
++        if all(x[0] != u[0] for x in dec.unsaved):
++            dec.store.deferred.pop(u[0], None)
+ 
+ 
+ def restore(dec, prompt: list[int]) -> None:
+diff --git a/src/tensorfold/families/qwen3_5_moe/cuda/multi.py b/src/tensorfold/families/qwen3_5_moe/cuda/multi.py
+index ecfd363..f282a61 100644
+--- a/src/tensorfold/families/qwen3_5_moe/cuda/multi.py
++++ b/src/tensorfold/families/qwen3_5_moe/cuda/multi.py
+@@ -17,6 +17,8 @@ from tensorfold.families.qwen3_5.cuda.engine import entry_end
+ from tensorfold.families.qwen3_5.cuda.forward import State, _mm, commit_streams, multi_tree_forward
+ from tensorfold.families.qwen3_5.cuda.multi import kept, private
+ 
++from tensorfold.cuda import keep_rank
++
+ from . import disk_points
+ from .decode import COPY_ROWS, Carry, extend, mtp_round, picks
+ from .mtp import Cache, Head
+@@ -25,26 +27,25 @@ STEP = int(os.environ.get("TF_PREFILL_STEP", "1024"))   # prompt rows a prefill
+ 
+ 
+ class KeptEnds(PrefixCache):
+-    """``PrefixCache`` whose cap drops a conversation's older states before any conversation's latest one.
++    """``PrefixCache`` whose cap drops by ``keep_rank`` (patch 0010; 0103 before): a state inside a conversation's
++    history first (a newer state of it extends it; it is on disk), then a conversation's newest state, then a shared
++    starting point (a reused system prompt, a point resumed with 2+ different continuations, the base of 2+ diverging
++    kept states), the oldest first within each (a hit makes an entry the newest); a state not yet copied for the disk
++    store last of all."""
+ 
+-    Each turn adds 2-3 states (its message starts and its prompt end), and the plain rule (the oldest never resumed
+-    from, else the oldest) let several conversations at once push each other's states out: none resumed. A state that
+-    a newer one extends (an earlier point of the same conversation, or a shared system block) goes first, never
+-    resumed ones before resumed ones, oldest first; then the plain rule over the latest states."""
++    def __init__(self, keep: int = 8) -> None:
++        super().__init__(keep)
++        self.conts: dict = {}                              # point -> the continuations requests resumed it with
++        self.waiting = lambda entry: False                 # not yet copied for the disk store (set by the decoder)
+ 
+     def _drop(self, among: list) -> None:
+-        def extended(entry) -> bool:
+-            ids, n = entry[0], len(entry[0])
+-            return n > 0 and any(len(o[0]) > n and o[0][n - 1] == ids[-1] and o[0][:n] == ids for o in self.entries)
+-
+-        older = [e for e in among if extended(e)]
+-        if older:
+-            cold = [e for e in older if tuple(e[0]) not in self.hit]
+-            gone = cold[0] if cold else older[0]
+-            self.entries = [e for e in self.entries if e is not gone]
+-            self.hit &= {tuple(e[0]) for e in self.entries}
+-            return
+-        super()._drop(among)
++        idx = {id(e): i for i, e in enumerate(self.entries)}
++        at = keep_rank.victim([e[0] for e in self.entries],
++                              [len(self.conts.get(keep_rank.point_key(e[0]), ())) for e in self.entries],
++                              [self.waiting(e) for e in self.entries], [idx[id(e)] for e in among if id(e) in idx])
++        gone = self.entries[at]
++        self.entries = [e for e in self.entries if e is not gone]
++        self.hit &= {tuple(e[0]) for e in self.entries}
+ 
+ 
+ @dataclass
+@@ -69,6 +70,7 @@ class MultiDecoder:
+     """The ``Scheduler``'s decoder: a prefill step, then every stream's window (16 rows at most) in one forward; a lone stream replays ``graphs``."""
+ 
+     store = None                                     # the prompt store on disk (patch 0104); set by __init__ when it is on
++    unsaved = ()                                     # patch 0010/0107: kept states waiting for room in the disk queue
+ 
+     def __init__(self, w, head: Head | None, *, depth: int, confidence: float, context: int = 0, keep: int = 3,
+                  points=None, graphs=None) -> None:
+@@ -87,6 +89,11 @@ class MultiDecoder:
+         self.graphs = graphs if self.head is not None else None
+         self.resident: Stream | None = None          # the stream whose state is in the graphs' buffers
+         self.store = disk_points.open_store(self) if self.head is not None else None
++        self.unsaved = []
++        self._watch()
++
++    def _watch(self) -> None:
++        self.cache.waiting = lambda e: any(u[2] is e[1] for u in self.unsaved)
+ 
+     def live(self) -> int:
+         return len(self.streams) + len(self.filling)
+@@ -105,6 +112,8 @@ class MultiDecoder:
+         if drafting and self.store is not None:
+             disk_points.restore(self, s.prompt)
+         hit = self.cache.longest(s.prompt) if drafting else None
++        if hit is not None:
++            keep_rank.note(self.cache.conts, s.prompt, len(hit[0]), [e[0] for e in self.cache.entries])
+         if hit is not None and self.store is not None:
+             self.store.used(self.store.prefix(s.prompt), len(hit[0]))
+         need = len(s.prompt) + s.count                # the most the stream's attention caches ever hold
+@@ -197,6 +206,8 @@ class MultiDecoder:
+     def round(self) -> list[Stream]:
+         """A prefill step for the next queued prompt, then one round over the decoding streams; returns the finished."""
+ 
++        if self.unsaved:
++            disk_points.retry(self)                  # patch 0107: as soon as the disk queue has room
+         done = self._fill() if self.filling else []
+         live = [s for s in self.streams.values() if not s.done]
+         if not live:
+@@ -345,6 +356,7 @@ class MultiDecoder:
+         finally:
+             self.store = store
+         self.cache = KeptEnds(self.cache.keep)
++        self._watch()
+         st = State(self.w)
+         for rows in sorted({1, 16, 32, 64, 128, 16 * streams}):
+             if rows > 16 * streams:
+@@ -367,6 +379,8 @@ class MultiDecoder:
+             self.streams.pop(s.sid, None)
+             if s is self.resident:
+                 self.resident = None
++        if self.unsaved and not self.streams and not self.filling:
++            disk_points.retry(self, force=True)      # patch 0107: idle: every waiting state is copied now
+ 
+     def drop(self) -> list[Stream]:
+         """After an error in a round: forget the live streams and the queued prompts."""
+diff --git a/tests/test_qwen36_prompt_store.py b/tests/test_qwen36_prompt_store.py
+index 12cd08b..ab1a212 100644
+--- a/tests/test_qwen36_prompt_store.py
++++ b/tests/test_qwen36_prompt_store.py
+@@ -24,6 +24,7 @@ class _Dec:
+ 
+     def __init__(self, w):
+         self.w, self.cache, self.streams, self.filling = w, KeptEnds(8), {}, []
++        self.unsaved = []
+         self.store = disk_points.open_store(self)
+ 
+     def add(self, ids, state, snap):
+@@ -120,3 +121,49 @@ def _cut_mc(mc, pos):
+     other = mc.view()
+     other.pos = pos
+     return other
++
++
++def test_full_queue_waits_in_gpu_never_drops(env, monkeypatch):
++    """Patch 0107: past the queue's cap a kept state waits in GPU memory and is copied when there is room."""
++    monkeypatch.setenv("TF_PROMPT_CACHE_QUEUE_GIB", "1e-9")
++    w = _weights()
++    a = _Dec(w)
++    store = a.store
++    store.queued = store.queue_cap                                          # the writer is behind
++    for j in range(3):
++        state, snap = _state(w, 1100 + 300 * j, j)
++        a.add(list(range(7 * j, 7 * j + 1100 + 300 * j)), state, snap)
++    assert len(a.unsaved) == 3 and store.stats["deferred"] == 3 and store.stats["dropped"] == 0
++    disk_points.retry(a)                                                    # still full
++    assert len(a.unsaved) == 3
++    store.queued -= store.queue_cap
++    store.queue_cap = 1 << 40
++    disk_points.retry(a)
++    assert not a.unsaved
++    _drain(store)
++    assert len(store.points) == 3 and store.stats["lost"] == 0
++    full = _Dec(w)                                                          # forced copies go past the cap
++    full.store.queued = full.store.queue_cap = 1
++    state, snap = _state(w, 1300, 9)
++    disk_points.capture(full, list(range(500, 1800)), state, snap, force=True)
++    assert not full.unsaved and full.store.stats["forced"] == 1
++
++
++def test_kept_ends_keep_shared_starts():
++    """Over the cap: history states first, then conversations' newest; a reused system prompt's state stays."""
++    import numpy as np
++    from tensorfold.cuda import keep_rank
++    keep_rank.OPENERS = np.array([1])
++    c = KeptEnds(3)
++    sys_ = [1] + [7] * 300
++    c.add(sys_, "s0", None)
++    keep_rank.note(c.conts, sys_ + [1, 5], len(sys_))
++    keep_rank.note(c.conts, sys_ + [1, 6], len(sys_))
++    a1 = sys_ + [1, 8] + [3] * 40
++    c.add(a1, "a1", None)
++    c.add(a1 + [1, 9] + [3] * 40, "a2", None)                               # a1 is now history
++    c.add(sys_ + [1, 11], "b", None)
++    assert [e[1] for e in c.entries] == ["s0", "a2", "b"]
++    c.waiting = lambda e: e[1] == "a2"
++    c.add(sys_ + [1, 12], "c", None)
++    assert [e[1] for e in c.entries] == ["s0", "a2", "c"]                   # "b" went; unsaved "a2" stayed
+-- 
+2.43.0
+
