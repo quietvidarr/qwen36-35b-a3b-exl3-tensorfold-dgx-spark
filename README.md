@@ -2,6 +2,16 @@
 
 Qwen3.6-35B-A3B in EXL3, served by TensorFold 0.6.5 on one GB10. OpenAI API on 127.0.0.1:8001.
 
+## Quick start
+
+```bash
+export GH_TOKEN=<token>   # while the TensorFold fork is private
+(cd ../qwen38-flash-next-dgx-spark && local/build.sh)   # Flash recipe, sibling clone: makes the base image
+local/download.sh         # weights, resumable, sha256-verified
+local/build.sh            # base image + TensorFold fork at the pinned commit
+local/start.sh            # 127.0.0.1:8001; local/stop.sh. Optional first: local/prebuild.sh
+```
+
 ## Credits
 
 - Recipe base: souf, [sxuff/qwen38-flash-next-dgx-spark](https://github.com/sxuff/qwen38-flash-next-dgx-spark) (MIT, © 2026 souf): TensorFold base image, `vision-prefix-cache.patch`.
@@ -11,18 +21,8 @@ Qwen3.6-35B-A3B in EXL3, served by TensorFold 0.6.5 on one GB10. OpenAI API on 1
 ## Requirements
 
 - DGX Spark (GB10, 128 GB), Docker with GPU.
-- Flash recipe's base image `qwen38-flash-next-tensorfold:609ca419` built locally.
+- The Flash recipe ([qwen38-flash-next-dgx-spark](https://github.com/quietvidarr/qwen38-flash-next-dgx-spark), branch `local-patches`) cloned next to this one (else `FLASH_RECIPE`); its `local/build.sh` makes the base image `qwen38-flash-next-tensorfold:609ca419`.
 - ~27 GB disk for weights.
-
-## Quick start
-
-```bash
-local/download.sh   # weights, resumable, sha256-verified
-local/build.sh      # our image: base + fork at the pinned commit
-local/prebuild.sh   # optional: compile CUDA extensions now
-local/start.sh      # serves on 127.0.0.1:8001
-local/stop.sh
-```
 
 ## Config (`.env` overrides `local/config.sh`)
 
