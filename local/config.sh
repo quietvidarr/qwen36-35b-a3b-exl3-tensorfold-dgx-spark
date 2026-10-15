@@ -48,7 +48,7 @@ source "$RECIPE_DIR/local/pins.env"
 : "${TF_PROMPT_CACHE_QUEUE_GIB:=4}"            # host copies waiting for the disk writer; past it points wait on the GPU (0010)
 : "${TF_PROMPT_CACHE_EXIT_S:=20}"              # a stopping server waits this long for the writer (stop.sh gives 30 s)
 
-FLASH_RECIPE="${FLASH_RECIPE:-$HOME/recipes/qwen3.8-flash-next-exl3-tensorfold}"   # where BASE_IMAGE comes from
+FLASH_RECIPE="${FLASH_RECIPE:-$RECIPE_DIR/../qwen38-flash-next-dgx-spark}"   # where BASE_IMAGE comes from (a sibling clone)
 HF_HUB="${HF_HUB_CACHE:-$HOME/.cache/huggingface/hub}"
 MODEL_CACHE="$HF_HUB/models--${MODEL_REPO//\//--}"
 MODEL_DIR="$MODEL_CACHE/snapshots/$MODEL_REVISION"
