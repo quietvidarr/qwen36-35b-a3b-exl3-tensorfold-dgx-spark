@@ -1,21 +1,26 @@
 #!/bin/bash
-# Build our image offline: BASE_IMAGE (local/pins.env; built by the Flash recipe, never pulled here) plus our
-# TensorFold patches and serve wrapper. Prints the image tag on its last line.
+# Build our image: BASE_IMAGE (local/pins.env; built by the Flash recipe's local/build.sh, never pulled here) with
+# TensorFold from our fork at the pinned commit (local/tensorfold-src.sh: needs the network once; private fork:
+# GH_TOKEN) and our serve wrapper. The docker build itself is offline. Prints the image tag on its last line.
 #   local/build.sh          build what is missing
 #   local/build.sh --force  rebuild our layer even if the tag exists
 set -euo pipefail
 source "$(dirname "$0")/config.sh"
 cd "$RECIPE_DIR"
-IMG="$(TF_LOCAL_IMAGE= local_image)"     # always the tag of the patches (TF_LOCAL_IMAGE only pins what start.sh runs)
+IMG="$(TF_LOCAL_IMAGE= local_image)"     # always the tag of the pinned inputs (TF_LOCAL_IMAGE only pins what start.sh runs)
 docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || {
-  log "base image $BASE_IMAGE missing: it is the Flash recipe's upstream image ($FLASH_RECIPE: local/build.sh builds it)"
+  log "base image $BASE_IMAGE missing: build the Flash recipe first ($FLASH_RECIPE/local/build.sh builds it)"
   exit 1; }
 if [ "${1:-}" != --force ] && docker image inspect "$IMG" >/dev/null 2>&1; then
   log "have $IMG"; echo "$IMG"; exit 0
 fi
+SRC="$(local/tensorfold-src.sh)"
 ctx=$(mktemp -d); trap 'rm -rf "$ctx"' EXIT
-mkdir -p "$ctx/local"; cp -r local/Dockerfile local/serve_local.py local/patches "$ctx/local/"
-docker build --network none --build-arg BASE="$BASE_IMAGE" -f "$ctx/local/Dockerfile" -t "$IMG" "$ctx"
+mkdir -p "$ctx/local" "$ctx/tensorfold"; cp local/Dockerfile local/serve_local.py "$ctx/local/"
+git -C "$SRC" archive "$TENSORFOLD_FORK_REV" | tar -x -C "$ctx/tensorfold"
+echo "$TENSORFOLD_FORK_REV" > "$ctx/tensorfold/.fork-rev"
+docker build --network none --build-arg BASE="$BASE_IMAGE" --build-arg TENSORFOLD_FORK_REV="$TENSORFOLD_FORK_REV" \
+  -f "$ctx/local/Dockerfile" -t "$IMG" "$ctx"
 # the patched runtime imports (CPU only, no GPU): the 35B's EXL3 path, the 256-column strips, the kept-ends cache
 docker run --rm --network none --entrypoint python3 "$IMG" -c '
 import inspect

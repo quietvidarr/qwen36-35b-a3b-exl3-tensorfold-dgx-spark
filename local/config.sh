@@ -1,5 +1,5 @@
 # Our settings for this recipe (sourced by local/*.sh). Defaults here; put overrides in ./.env (KEY=value lines,
-# git-ignored). Pins (base image, TensorFold revision, weights repo/branch/revision) are in local/pins.env.
+# git-ignored). Pins (base image, TensorFold fork commit, weights repo/branch/revision) are in local/pins.env.
 # See README.md and LOCAL_CHANGES.md.
 
 RECIPE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -53,13 +53,16 @@ HF_HUB="${HF_HUB_CACHE:-$HOME/.cache/huggingface/hub}"
 MODEL_CACHE="$HF_HUB/models--${MODEL_REPO//\//--}"
 MODEL_DIR="$MODEL_CACHE/snapshots/$MODEL_REVISION"
 
-# Our image: BASE_IMAGE (the Flash recipe's upstream TensorFold image) plus local/patches/tensorfold/*.patch and our
-# serve wrapper, built offline by local/build.sh. Its tag names both inputs, so a change to either asks for a rebuild.
+TENSORFOLD_SRC="${TENSORFOLD_SRC:-$RECIPE_DIR/.cache/TensorFold-spark}"   # clone of the fork (local/tensorfold-src.sh)
+
+# Our image: BASE_IMAGE (the Flash recipe's upstream TensorFold image) with TensorFold from our fork at
+# TENSORFOLD_FORK_REV and our serve wrapper, built by local/build.sh. Its tag names both inputs, so a change to either
+# asks for a rebuild.
 local_image() {
-  # TF_LOCAL_IMAGE in .env pins an earlier build (rollback: e.g. the tag before patch 0010); empty = built from patches
+  # TF_LOCAL_IMAGE in .env pins an earlier build (rollback); empty = built from the pinned fork commit
   [ -n "${TF_LOCAL_IMAGE:-}" ] && { echo "$TF_LOCAL_IMAGE"; return; }
   local h
-  h=$(cat "$RECIPE_DIR"/local/Dockerfile "$RECIPE_DIR"/local/serve_local.py "$RECIPE_DIR"/local/patches/tensorfold/*.patch | sha256sum | cut -c1-12)
+  h=$( (cat "$RECIPE_DIR"/local/Dockerfile "$RECIPE_DIR"/local/serve_local.py; echo "$TENSORFOLD_FORK_REV") | sha256sum | cut -c1-12)
   echo "qwen36-35b-a3b-tensorfold-local:${BASE_IMAGE##*:}-$h"
 }
 log() { printf '[q36-exl3-tf] %s\n' "$*"; }

@@ -1,12 +1,14 @@
-# Our image = the Flash recipe's upstream TensorFold image (TensorFold 609ca419 + its vision-prefix-cache.patch, at
-# /opt/TensorFold) + our TensorFold patches, applied in name order, + our serve wrapper. Built offline by local/build.sh.
+# Our image = the Flash recipe's upstream TensorFold image (CUDA, torch, deps) with /opt/TensorFold replaced by our
+# fork's tree at TENSORFOLD_FORK_REV (local/pins.env), + our serve wrapper. local/build.sh puts that tree (git archive
+# of the pinned commit) in the build context; the build itself is offline.
 ARG BASE
 FROM ${BASE}
-COPY local/patches/tensorfold/ /opt/recipe-qwen36/patches/
-RUN set -e; cd /opt/TensorFold; \
-    for p in /opt/recipe-qwen36/patches/*.patch; do git apply --check "$p"; git apply "$p"; echo "applied $p"; done; \
+ARG TENSORFOLD_FORK_REV
+COPY tensorfold/ /opt/TensorFold.fork/
+RUN set -e; test "$(cat /opt/TensorFold.fork/.fork-rev)" = "$TENSORFOLD_FORK_REV"; \
+    rm -rf /opt/TensorFold; mv /opt/TensorFold.fork /opt/TensorFold; \
     python3 -m pip install --no-deps --no-build-isolation --no-index /opt/TensorFold
 COPY local/serve_local.py /opt/recipe-qwen36/serve_local.py
-LABEL qwen.local.patches=1 qwen.recipe=qwen36-35b-a3b-exl3-tensorfold
+LABEL qwen.local.patches=1 qwen.recipe=qwen36-35b-a3b-exl3-tensorfold qwen.tensorfold.fork.rev=${TENSORFOLD_FORK_REV}
 WORKDIR /opt/recipe-qwen36
 ENTRYPOINT ["python3", "/opt/recipe-qwen36/serve_local.py"]
