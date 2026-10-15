@@ -1,0 +1,29 @@
+{
+    "Qwen3.6-35B-A3B-EXL3-6.00bpw-TensorFold": {
+        "engine": "tensorfold",
+        "aliases": [
+            "yeasah/Qwen3.6-35B-A3B-exl3",
+            "qwen3.6-35b-exl3",
+            "qwen3.6-35b-a3b-exl3",
+            "qwen36-35b-exl3",
+            "qwen36-exl3",
+            "qwen3.6-exl3",
+            "35b-exl3",
+            "35b-exl3-tensorfold",
+            "35b-tensorfold",
+            "35b-tf"
+        ],
+        "dir": "/home/USER/recipes/qwen3.6-35b-a3b-exl3-tensorfold",
+        "start": "./local/start.sh",
+        "stop": "./local/stop.sh",
+        "served_name": "Qwen3.6-35B-A3B-EXL3-6.00bpw-TensorFold",
+        "container": "Qwen3.6-35B-A3B-EXL3-6.00bpw-TensorFold",
+        "hf_repo": "yeasah/Qwen3.6-35B-A3B-exl3",
+        "hf_branch": "6.00bpw",
+        "weights_update": "./local/download.sh --follow",
+        "image_cmd": "./local/image.sh ref",
+        "image_update": "./local/image.sh update",
+        "image_build": true,
+        "update_check": "./local/check-update.sh"
+    }
+}
