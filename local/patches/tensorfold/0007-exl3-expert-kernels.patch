@@ -1,0 +1,136 @@
+Local patch 0007 (qwen3.8-flash-next-exl3-tensorfold): faster EXL3 expert kernels, outputs unchanged.
+
+Why: profiling the Qwen3.6-35B EXL3 recipe (which shares these kernels) showed the decode grouping kernel taking ~60 us a
+layer at 8 streams: one block, every thread scanning every pick per expert (O(experts x picks)), ~3 ms of a 78 ms round.
+What:
+- cuda/exl3/experts.cu group_kernel: counts by a shared-memory histogram, the same scan numbering the used experts in id
+  order, then one warp lists each expert's members in pick order (__match_any_sync, 32 picks a step). Identical lists
+  (checked on random picks, 1-400 rows), 3-7x faster (32 rows: 68 -> 10 us; 128 rows: 279 -> 41 us). Its dynamic shared
+  memory adds two ints an expert, so tests/cuda/test_group_kernel_smem.py's largest launch takes that into account.
+- cuda/exl3/experts_prefill.cuh prefill_strip: a full pass (every member tile used, most passes) loads all A fragments
+  of a K step before its multiplies, without the per-tile break; each accumulator gets the same mma in the same order:
+  bit-identical, ~1-2% faster prompt experts.
+Tests (GPU, Flash image): test_exl3_experts, test_exl3_prompt_experts, test_group_kernel_smem, test_qwen4_exp_exl3,
+test_exl3_any_width_glm: same results before and after.
+
+diff --git a/src/tensorfold/cuda/exl3/experts.cu b/src/tensorfold/cuda/exl3/experts.cu
+index e41b0bf..b7b46a1 100644
+--- a/src/tensorfold/cuda/exl3/experts.cu
++++ b/src/tensorfold/cuda/exl3/experts.cu
+@@ -20,21 +20,28 @@ constexpr int GROUP_PER_THREAD = 4;
+ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restrict__ pick, int* __restrict__ uids,
+                                                               int* __restrict__ ucount, int* __restrict__ members,
+                                                               int R, int slots, int E, int maxm) {
+-    extern __shared__ int sh_pick[];
++    // counts by a shared histogram, then one warp lists the members in pick order, 32 picks a step (local patch
++    // 0105: the same lists as scanning every pick per expert, in O(picks) instead of O(experts * picks))
++    extern __shared__ int sh_pick[];                            // n picks, then E counts and E list numbers
+     __shared__ int warp_tot[GROUP_THREADS / 32];
+     const int n = R * slots;
++    int* sh_cnt = sh_pick + n;                                  // per expert: count, then members listed so far
++    int* sh_place = sh_cnt + E;                                 // per expert: its list
++    for (int e = threadIdx.x; e < E; e += GROUP_THREADS) sh_cnt[e] = 0;
+     for (int i = threadIdx.x; i < n; i += GROUP_THREADS) sh_pick[i] = pick[i];
+     __syncthreads();
++    for (int i = threadIdx.x; i < n; i += GROUP_THREADS) {
++        const int e = sh_pick[i];
++        if (e >= 0 && e < E) atomicAdd(&sh_cnt[e], 1);
++    }
++    __syncthreads();
+     int cnt[GROUP_PER_THREAD];
+     int used = 0;
+ #pragma unroll
+     for (int q = 0; q < GROUP_PER_THREAD; ++q) {
+         const int e = threadIdx.x * GROUP_PER_THREAD + q;
+-        int c = 0;
+-        if (e < E)
+-            for (int i = 0; i < n; ++i) c += sh_pick[i] == e;
+-        cnt[q] = c;
+-        used += c > 0;
++        cnt[q] = e < E ? sh_cnt[e] : 0;
++        used += cnt[q] > 0;
+     }
+     // exclusive scan of `used` over threads
+     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+@@ -61,15 +68,30 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
+     int place = warp_tot[warp] + inc - used;
+ #pragma unroll
+     for (int q = 0; q < GROUP_PER_THREAD; ++q) {
+-        if (cnt[q] == 0) continue;
+         const int e = threadIdx.x * GROUP_PER_THREAD + q;
++        if (e < E) sh_cnt[e] = 0;
++        if (cnt[q] == 0) continue;
+         uids[place] = e;
+-        int j = 0;
+-        for (int i = 0; i < n && j < maxm; ++i)
+-            if (sh_pick[i] == e) members[place * maxm + j++] = (i / slots) * 32 + (i % slots);
+-        for (; j < maxm; ++j) members[place * maxm + j] = -1;
++        sh_place[e] = place;
++        for (int j = min(cnt[q], maxm); j < maxm; ++j) members[place * maxm + j] = -1;
+         ++place;
+     }
++    __syncthreads();
++    if (warp == 0) {
++        for (int base = 0; base < n; base += 32) {
++            const int i = base + lane;
++            const int e = i < n ? sh_pick[i] : -1;
++            const bool ok = e >= 0 && e < E;
++            const unsigned same = __match_any_sync(0xffffffffu, ok ? e : -1);
++            if (ok) {
++                const int j = sh_cnt[e] + __popc(same & ((1u << lane) - 1u));
++                if (j < maxm) members[sh_place[e] * maxm + j] = (i / slots) * 32 + (i % slots);
++            }
++            __syncwarp();
++            if (ok && lane == __ffs(same) - 1) sh_cnt[e] += __popc(same);
++            __syncwarp();
++        }
++    }
+ }
+ 
+ // Grouping for any number of rows (the prompt path), in three launches: counts per expert, a scan that numbers the
+@@ -406,7 +428,7 @@ void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucou
+                       int64_t slots, int64_t E) {
+     TORCH_CHECK(E <= GROUP_THREADS * GROUP_PER_THREAD, "too many experts for the grouping kernel");
+     TORCH_CHECK(slots <= 32, "at most 32 slots a row");
+-    const size_t smem = (size_t)R * slots * sizeof(int);
++    const size_t smem = ((size_t)R * slots + 2 * (size_t)E) * sizeof(int);
+     constexpr size_t static_smem = GROUP_THREADS / 32 * sizeof(int);
+     if (smem + static_smem > 48 * 1024) {
+         cudaFuncAttributes attributes;
+diff --git a/src/tensorfold/cuda/exl3/experts_prefill.cuh b/src/tensorfold/cuda/exl3/experts_prefill.cuh
+index a9db1cb..67e11e2 100644
+--- a/src/tensorfold/cuda/exl3/experts_prefill.cuh
++++ b/src/tensorfold/cuda/exl3/experts_prefill.cuh
+@@ -200,6 +200,19 @@ __device__ __forceinline__ void prefill_strip(char* sm, const half* __restrict__
+                 for (int l = 0; l < LW; ++l) w[l] = (l * 32 + lane < TW) ? tile[l * 32 + lane] : 0u;
+                 decode_tile<CB, K2>(w, map, lane, bf[i][0], bf[i][1]);
+             }
++            if (active == MTW) {                        // a full pass (most): every fragment loaded first, no branch
++                uint32_t a[MTW][4];
++#pragma unroll
++                for (int mt = 0; mt < MTW; ++mt) ldmatrix_a(a[mt], A + mt * 16 * L::LD + kk * 16, L::LD, lane);
++#pragma unroll
++                for (int mt = 0; mt < MTW; ++mt)
++#pragma unroll
++                    for (int i = 0; i < NTW; ++i) {
++                        mma16816_pure(acc[mt][i][0], a[mt], bf[i][0]);
++                        mma16816_pure(acc[mt][i][1], a[mt], bf[i][1]);
++                    }
++                continue;
++            }
+ #pragma unroll
+             for (int mt = 0; mt < MTW; ++mt) {
+                 if (mt >= active) break;
+diff --git a/tests/cuda/test_group_kernel_smem.py b/tests/cuda/test_group_kernel_smem.py
+index f037da8..7b0428e 100644
+--- a/tests/cuda/test_group_kernel_smem.py
++++ b/tests/cuda/test_group_kernel_smem.py
+@@ -80,7 +80,7 @@ def _launch(rows, slots=SLOTS, device="cuda"):
+ 
+ def test_device_limit_allows_more_than_a_hardcoded_96_kib_when_available():
+     limit = torch.cuda.get_device_properties(0).shared_memory_per_block_optin - 128
+-    rows = limit // (SLOTS * 4)
++    rows = (limit - 2 * EXPERTS * 4) // (SLOTS * 4)          # local 0105: the picks plus two ints an expert
+     if rows * SLOTS * 4 <= 96 * 1024:
+         pytest.skip("this device has no grouping launch between 96 KiB and its opt-in limit")
+     _launch(rows)

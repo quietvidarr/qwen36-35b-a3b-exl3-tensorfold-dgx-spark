@@ -1,0 +1,718 @@
+From 86aa16289043e23d8605d0256ea9afd0bd467f3f Mon Sep 17 00:00:00 2001
+From: quietvidarr <343052645+quietvidarr@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 10:54:29 +0200
+Subject: [PATCH] local 0010: prompt cache points at every message start, never
+ dropped, shared starts kept on the GPU
+
+---
+ src/tensorfold/cuda/keep_rank.py              |  88 ++++++++++++
+ src/tensorfold/cuda/markers.py                |  21 ++-
+ src/tensorfold/cuda/prompt_store.py           | 118 ++++++++++++++--
+ .../families/qwen4_exp/cuda/disk_points.py    |  46 ++++++-
+ .../families/qwen4_exp/cuda/multi.py          |  26 +++-
+ .../families/qwen4_exp/cuda/prefixes.py       |  35 +++--
+ tests/cuda/test_prompt_store.py               | 126 ++++++++++++++++++
+ 7 files changed, 433 insertions(+), 27 deletions(-)
+ create mode 100644 src/tensorfold/cuda/keep_rank.py
+
+diff --git a/src/tensorfold/cuda/keep_rank.py b/src/tensorfold/cuda/keep_rank.py
+new file mode 100644
+index 0000000..84c1184
+--- /dev/null
++++ b/src/tensorfold/cuda/keep_rank.py
+@@ -0,0 +1,88 @@
++"""Which kept prompt point leaves GPU memory first (local patch 0010). Family-independent: a decoder passes its kept
++points' token ids (oldest first), how many different continuations requests resumed each one with, and which ones are
++not yet copied for the disk store.
++
++Ranks, lowest dropped first, the oldest first within a rank:
++
++  0  a point inside one conversation's history: a newer kept point of the same conversation extends it. With a point
++     at every message start these are most of them, and each is in the disk store already.
++  1  a conversation's newest point (where its next turn resumes) or a one-off prompt's end.
++  2  a shared starting point: a first-message point (a system prompt plus tools) that a request resumed from, a point
++     that requests resumed from with 2 or more different continuations (forks, regenerates, edits, other
++     conversations), or the common prefix of 2 or more kept points that went different ways.
++  3  a point not yet copied for the disk store (its only copy is this GPU state): dropped only when nothing else is
++     left, and then copied first.
++"""
++
++from __future__ import annotations
++
++from typing import Sequence
++
++import numpy as np
++
++OPENERS = np.zeros(0, dtype=np.int64)        # message-start token ids (set by ``markers.snapshot_points``)
++CONT = 16                                    # tokens past a point that tell its continuations apart
++
++
++def extends(a: Sequence[int], b: Sequence[int]) -> bool:
++    """``a`` strictly extends ``b``."""
++
++    n = len(b)
++    if len(a) <= n or (n and a[n - 1] != b[n - 1]):
++        return False
++    return a[:n] == b if isinstance(a, list) and isinstance(b, list) else list(a[:n]) == list(b)
++
++
++def first_point(ids: Sequence[int]) -> bool:
++    """A point at the end of a prompt's first message (one message opener in it: a system prompt plus tools)."""
++
++    if not len(OPENERS) or not len(ids):
++        return False
++    return int(np.isin(np.asarray(ids, dtype=np.int64), OPENERS).sum()) == 1
++
++
++def ranks(ids: list[Sequence[int]], conts: list[int], unsaved: list[bool]) -> list[int]:
++    out = []
++    for i, a in enumerate(ids):
++        if unsaved[i]:
++            out.append(3)
++            continue
++        ext = [j for j, o in enumerate(ids) if j != i and extends(o, a)]
++        leaves = [j for j in ext if not any(m != j and extends(ids[m], ids[j]) for m in ext)]
++        shared = conts[i] >= 2 or len(leaves) >= 2 or (conts[i] >= 1 and first_point(a))
++        out.append(2 if shared else 0 if ext else 1)
++    return out
++
++
++def victim(ids: list[Sequence[int]], conts: list[int], unsaved: list[bool], among: Sequence[int] | None = None) -> int:
++    """The index (into ``ids``, oldest first) of the point to drop: the lowest rank, then the oldest."""
++
++    r = ranks(ids, conts, unsaved)
++    cand = range(len(ids)) if among is None else among
++    return min(cand, key=lambda i: (r[i], i))
++
++
++def point_key(ids: Sequence[int], n: int | None = None) -> tuple:
++    """A kept point's identity for ``conts`` (its length and last tokens)."""
++
++    n = len(ids) if n is None else n
++    return (n, tuple(int(x) for x in ids[max(0, n - CONT):n]))
++
++
++def note(conts: dict, prompt: Sequence[int], n: int, keep: list | None = None) -> None:
++    """A request resumed from the point at ``n``: remember what it continued with (``keep``: the kept points' ids,
++    to forget the points no longer kept)."""
++
++    if n <= 0:
++        return
++    conts.setdefault(point_key(prompt, n), set()).add(cont_key(prompt, n))
++    if keep is not None and len(conts) > 4 * len(keep) + 16:
++        live = {point_key(ids) for ids in keep}
++        for key in [k for k in conts if k not in live]:
++            del conts[key]
++
++
++def cont_key(prompt: Sequence[int], n: int) -> tuple:
++    """What a request resuming from the point at ``n`` continues with (tells forks and conversations apart)."""
++
++    return tuple(int(x) for x in prompt[n:n + CONT])
+diff --git a/src/tensorfold/cuda/markers.py b/src/tensorfold/cuda/markers.py
+index b1b2e8d..511559d 100644
+--- a/src/tensorfold/cuda/markers.py
++++ b/src/tensorfold/cuda/markers.py
+@@ -12,7 +12,15 @@ MIN_GAP = 256            # a snapshot this close to the prompt start or to the p
+ # local patch 0006: also keep states at the last LAST message starts. A client that changes a recent message when it
+ # sends the next turn (e.g. an agent client that adds recalled memories to the newest user message and leaves them out of the history)
+ # then resumes from that message's start instead of from the system prompt. 0: upstream's two points.
+-LAST = int(os.environ.get("TF_POINTS_LAST", "0") or 0)
++# local patch 0010: TF_POINTS_LAST=all keeps a state at EVERY message start (a fork, a regenerate or an edit at message
++# k resumes at k's start). MIN_GAP still applies: of two starts closer than it the earlier one stays, so a resume
++# point is never more than MIN_GAP tokens before any message start.
++_last = os.environ.get("TF_POINTS_LAST", "0").strip().lower()
++LAST = -1 if _last in ("all", "-1") else int(_last or 0)
++# With ``all``, starts before a prompt's last 3 are kept only TF_POINTS_GAP tokens apart (default MIN_GAP: every one).
++# Each kept point splits the prefill (about one more pass over the weights), so a long history arriving at once (an
++# imported or edited chat) pays per point; a chat built turn by turn meets its new starts as its last ones anyway.
++GAP = max(MIN_GAP, int(os.environ.get("TF_POINTS_GAP", "0") or 0))
+ 
+ 
+ class TemplateTokens:
+@@ -36,13 +44,22 @@ def snapshot_points(openers: Sequence[int], assistant: Sequence[int]) -> Callabl
+     from tensorfold.engine.prefill_plan import PrefillPlan
+ 
+     plan = PrefillPlan(openers=openers, assistant=assistant, min_chunk=max(MIN_GAP, len(assistant)))
++    from . import keep_rank
++    keep_rank.OPENERS = np.asarray(sorted(set(int(o) for o in openers)), dtype=np.int64)
+ 
+     def points(ids: Sequence[int]) -> list[int]:
+         arr = np.asarray(ids, dtype=np.int64)
+         found = plan.points(arr)
+         starts = np.flatnonzero(np.isin(arr, plan.openers)) if plan.openers else []
+         wanted = ([int(starts[1])] if len(starts) > 1 else []) + ([found[-1]] if found else [])
+-        if LAST > 0:
++        if LAST < 0:
++            last = -GAP
++            for p in starts[1:-3]:
++                if p - last >= GAP:
++                    wanted.append(int(p))
++                    last = int(p)
++            wanted += [int(p) for p in starts[1:][-3:]]
++        elif LAST > 0:
+             wanted += [int(p) for p in starts[1:][-LAST:]]
+         out: list[int] = []
+         for p in sorted(set(wanted)):
+diff --git a/src/tensorfold/cuda/prompt_store.py b/src/tensorfold/cuda/prompt_store.py
+index 02f34e3..4ed0c53 100644
+--- a/src/tensorfold/cuda/prompt_store.py
++++ b/src/tensorfold/cuda/prompt_store.py
+@@ -22,6 +22,7 @@ prompt-cache README).
+ 
+ from __future__ import annotations
+ 
++import atexit
+ import hashlib
+ import json
+ import os
+@@ -160,7 +161,9 @@ class Store:
+         self.normal_cap = int(_env("TF_PROMPT_CACHE_GIB", 100.0) * GIB)
+         self.pinned_cap = int(_env("TF_PROMPT_CACHE_PINNED_GIB", 50.0) * GIB)
+         self.pin_after = int(_env("TF_PROMPT_CACHE_PIN_AFTER", 3, int))
+-        self.queue_cap = int(_env("TF_PROMPT_CACHE_QUEUE_GIB", 2.0) * GIB)
++        # host memory the copies waiting for the writer may hold; past it a point waits in its GPU slot (patch 0010)
++        self.queue_cap = int(_env("TF_PROMPT_CACHE_QUEUE_GIB", 4.0) * GIB)
++        self.exit_s = _env("TF_PROMPT_CACHE_EXIT_S", 20.0)              # how long a stopping server waits for the writer
+         self.prefill_tps = _env("TF_PROMPT_CACHE_PREFILL_TPS", 1800.0)    # tokens a second a load saves recomputing
+         self.read_bps = _env("TF_PROMPT_CACHE_READ_GBS", 2.0) * 1e9        # measured from the loads as they happen
+         self.lock = threading.Lock()
+@@ -171,8 +174,13 @@ class Store:
+         self.held: Counter = Counter()                    # blocks a queued point uses (not deleted meanwhile)
+         self.repin: dict[str, tuple[str, str]] = {}       # ids hash -> (model, key) of an old key's pinned point
+         self.queued = 0
++        self.deferred: dict[str, int] = {}               # points waiting in their GPU slot for room in the queue
++        self.inflight: dict[str, int] = {}               # points queued for the writer, not yet written
++        # patch 0010: no point is dropped. deferred: waited in GPU memory for the queue; forced: copied past the queue's
++        # cap because its slot was needed; lost: could not be saved (a write failed, or the server stopped before the
++        # writer got to it); lost_before: queued by the previous run of this key and never written (killed, power)
+         self.stats = dict(saved=0, saved_bytes=0, dropped=0, loads=0, load_tokens=0, load_s=0.0, evicted=0,
+-                          pinned=0, errors=0)
++                          pinned=0, errors=0, deferred=0, forced=0, lost=0, lost_before=0, queue_peak=0)
+         self.q: queue.Queue = queue.Queue()
+         self.copier = Copier()
+         self.idle = idle
+@@ -187,8 +195,14 @@ class Store:
+             self.repin[ih] = (model, k)
+         db.close()
+         self._lengths()
++        torn = 0
+         for tmp in self.root.glob("*/[bp]/*.tmp"):
+             tmp.unlink(missing_ok=True)
++            torn += 1
++        self.jlock = threading.Lock()
++        self.jpath = self.root / self.key / "journal.log"
++        self._recover(torn)
++        atexit.register(self.close)
+         _log(f"{self.root} key {self.key} ({key}): {len(self.points)} points, {len(self.blocks)} blocks; normal "
+              f"{self.normal_cap / GIB:g} GiB for {self.ttl / 3600:g} h, pinned {self.pinned_cap / GIB:g} GiB after "
+              f"{self.pin_after} continuations; {len(self.repin)} pinned points of an older key to prefill again")
+@@ -226,17 +240,32 @@ class Store:
+                 return (k, n, hit[1]) if gain > 1.5 * cost + 0.05 else None
+         return None
+ 
+-    def put(self, k: str, n: int, ids, point: dict, blocks: dict, order: list[str], nbytes: int, ready=None) -> bool:
+-        """Queue a point and its new blocks for the writer; False (dropped) when the queue already holds too much."""
++    def full(self) -> bool:
++        """The queue holds its cap of host copies: a new point waits in its GPU slot (``defer``) until it drains."""
++
++        return self.queued >= self.queue_cap
++
++    def defer(self, k: str, n: int) -> None:
++        if k not in self.deferred:
++            self.deferred[k] = n
++            self.stats["deferred"] += 1
++            self._journal(f"q {k} {n}")
++
++    def put(self, k: str, n: int, ids, point: dict, blocks: dict, order: list[str], nbytes: int, ready=None,
++            forced: bool = False) -> bool:
++        """Queue a point and its new blocks for the writer. Never drops one (patch 0010): the caller keeps a point in
++        its GPU slot while ``full()``, and ``forced`` copies go past the cap when that slot is needed."""
+ 
+         with self.lock:
+-            if self.queued + nbytes > self.queue_cap:
+-                self.stats["dropped"] += 1
+-                return False
+             self.queued += nbytes
++            self.stats["queue_peak"] = max(self.stats["queue_peak"], self.queued)
+             self.pending.add(k)
+             self.pending.update(blocks)
+             self.held.update(order)
++            self.inflight[k] = n
++        self.stats["forced"] += int(forced)
++        if self.deferred.pop(k, None) is None:
++            self._journal(f"q {k} {n}")
+         self.q.put(("put", k, n, ids_hash(ids), point, blocks, order, nbytes, ready))
+         return True
+ 
+@@ -282,9 +311,18 @@ class Store:
+                 op = None
+             try:
+                 if op is not None and op[0] == "put":
+-                    if op[-1] is not None:
+-                        op[-1].synchronize()                  # the host copies have landed (``Copier``)
+-                    self._write(db, *op[1:-1])
++                    try:
++                        if op[-1] is not None:
++                            op[-1].synchronize()              # the host copies have landed (``Copier``)
++                        self._write(db, *op[1:-1])
++                        self._journal(f"w {op[1]}")
++                    except Exception as exc:  # noqa: BLE001
++                        self.stats["lost"] += 1
++                        self._journal(f"x {op[1]}")
++                        _log(f"point of {op[2]} tokens NOT saved: {type(exc).__name__}: {exc}")
++                        raise
++                if op is None:
++                    self._journal(None, unless_busy=True)     # nothing in flight: start the journal again
+                 elif op is not None and op[0] == "used":
+                     self._use(db, *op[1:])
+                 if time.time() - last > 60 or (op is not None and op[0] == "put"):
+@@ -328,6 +366,7 @@ class Store:
+             self.stats["saved_bytes"] += size + sum(sizes[h] for h in blocks)
+         finally:
+             with self.lock:
++                self.inflight.pop(k, None)
+                 self.pending.discard(k)
+                 self.pending.difference_update(blocks)
+                 self.held.subtract(order)
+@@ -398,9 +437,62 @@ class Store:
+ 
+     def _report(self) -> None:
+         s = self.stats
+-        _log(f"{len(self.points)} points; saved {s['saved']} ({s['saved_bytes'] / GIB:.1f} GiB), dropped "
+-             f"{s['dropped']}, loaded {s['loads']} ({s['load_tokens']} tokens, {s['load_s']:.1f} s), evicted "
+-             f"{s['evicted']}, pinned {s['pinned']}, errors {s['errors']}")
++        _log(f"{len(self.points)} points; saved {s['saved']} ({s['saved_bytes'] / GIB:.1f} GiB), loaded {s['loads']} "
++             f"({s['load_tokens']} tokens, {s['load_s']:.1f} s), evicted {s['evicted']}, pinned {s['pinned']}, "
++             f"errors {s['errors']}; waited in GPU {s['deferred']}, forced {s['forced']}, queue peak "
++             f"{s['queue_peak'] / GIB:.2f} GiB, LOST {s['lost']} (previous run {s['lost_before']})")
++        try:
++            tmp = self.root / self.key / "stats.json.tmp"
++            tmp.write_text(json.dumps({**s, "label": self.label, "points": len(self.points), "time": time.time()}))
++            os.replace(tmp, self.root / self.key / "stats.json")
++        except OSError:
++            pass
++
++    # -- never lose a point (patch 0010) ----------------------------------------------------------------------------
++    def _journal(self, line: str | None, unless_busy: bool = False) -> None:
++        """One line per point queued (q), written (w) or failed (x); ``None`` empties it. Survives a kill: the next
++        start counts the queued points never written."""
++
++        try:
++            with self.jlock:
++                if unless_busy and (self.inflight or self.deferred):
++                    return
++                self.jpath.parent.mkdir(parents=True, exist_ok=True)
++                with open(self.jpath, "w" if line is None else "a") as f:
++                    if line is not None:
++                        f.write(line + "\n")
++        except OSError:
++            pass
++
++    def _recover(self, torn: int) -> None:
++        if not self.jpath.is_file():
++            return
++        queued: dict[str, str] = {}
++        for line in self.jpath.read_text(errors="ignore").splitlines():
++            part = line.split()
++            if len(part) >= 2 and part[0] == "q":
++                queued[part[1]] = part[2] if len(part) > 2 else "?"
++            elif len(part) >= 2:
++                queued.pop(part[1], None)
++        lost = {k: n for k, n in queued.items() if k not in self.points}
++        self.stats["lost_before"] = len(lost)
++        if lost or torn:
++            _log(f"LOST at the previous stop (killed before the writer got to them): {len(lost)} points "
++                 f"({', '.join(sorted(lost.values(), key=lambda x: int(x) if x.isdigit() else 0))} tokens); "
++                 f"{torn} torn files removed")
++        self._journal(None)
++
++    def close(self) -> None:
++        """At exit (a stop is SIGTERM, then 30 s): give the writer up to ``TF_PROMPT_CACHE_EXIT_S`` to finish."""
++
++        t0 = time.time()
++        while (self.inflight or not self.q.empty()) and time.time() - t0 < self.exit_s:
++            time.sleep(0.1)
++        left = len(self.inflight) + len(self.deferred)
++        if left:
++            self.stats["lost"] += left
++            _log(f"stopping with {left} points not saved (counted as lost at the next start unless written)")
++        self._report()
+ 
+     # -- pinned points of an older key ----------------------------------------------------------------------------
+     def _rebuild(self) -> None:
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/disk_points.py b/src/tensorfold/families/qwen4_exp/cuda/disk_points.py
+index 236cb12..61d683e 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/disk_points.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/disk_points.py
+@@ -74,8 +74,10 @@ def open_store(dec):
+     return ps.open_store(geometry(st), idle=lambda: not dec.streams and not dec.filling)
+ 
+ 
+-def capture(dec, ids: list[int], st, snap: dict, tail) -> None:
+-    """Queue a kept point for the store (its new blocks and the rows past them), unless it is there already."""
++def capture(dec, ids: list[int], st, snap: dict, tail, *, force: bool = False) -> None:
++    """Queue a kept point for the store (its new blocks and the rows past them), unless it is there already. While the
++    queue is full (patch 0010) the point waits in its GPU slot (``dec.unsaved``) instead: ``retry`` copies it when the
++    queue has room, ``flush`` at once when its slot is about to be reused (``force``)."""
+ 
+     store = dec.store
+     n = len(ids)
+@@ -85,6 +87,11 @@ def capture(dec, ids: list[int], st, snap: dict, tail) -> None:
+     k = pre.point(n)
+     if store.has_point(k):
+         return
++    if not force and store.full():
++        if all(u[0] != k for u in dec.unsaved):
++            dec.unsaved.append((k, list(ids), st, snap, tail))
++            store.defer(k, n)
++        return
+     main, mtp = _caches(st)
+     cp = store.copier
+     m = int(snap["mtp_len"]) if mtp else n
+@@ -103,7 +110,39 @@ def capture(dec, ids: list[int], st, snap: dict, tail) -> None:
+     if tail is not None:
+         point["tail"] = cp.host(tail)
+     store.put(k, n, ids, point, blocks, order, _bytes(point) + sum(_bytes(b) for b in blocks.values()),
+-              ready=cp.done())
++              ready=cp.done(), forced=force and store.full())
++
++
++def _save(dec, u, force: bool) -> None:
++    dec.unsaved = [x for x in dec.unsaved if x is not u]
++    try:
++        capture(dec, u[1], u[2], u[3], u[4], force=force)
++    except Exception as exc:  # noqa: BLE001 - the disk copy never stops a request
++        dec.store.stats["errors"] += 1
++        print(f"[prompt-cache] save failed: {type(exc).__name__}: {exc}", flush=True)
++    if all(x[0] != u[0] for x in dec.unsaved):
++        dec.store.deferred.pop(u[0], None)
++
++
++def retry(dec, *, force: bool = False) -> None:
++    """Copy the points waiting in GPU slots, oldest first, while the queue has room (all of them: ``force``)."""
++
++    for u in list(dec.unsaved):
++        if not force and dec.store.full():
++            return
++        _save(dec, u, force)
++
++
++def flush(dec, st, above: int = 0) -> None:
++    """Slot ``st`` is about to be reset, reused or overwritten past ``above`` rows: copy its waiting points now."""
++
++    for u in list(dec.unsaved):
++        if u[2] is st and len(u[1]) > above:
++            _save(dec, u, True)
++
++
++def unsaved(dec, st, n: int) -> bool:
++    return any(u[2] is st and len(u[1]) == n for u in dec.unsaved)
+ 
+ 
+ def restore(dec, prompt: list[int], best) -> None:
+@@ -120,6 +159,7 @@ def restore(dec, prompt: list[int], best) -> None:
+     busy = dec._busy()
+     if dec.free:
+         st = dec.free.pop()
++        flush(dec, st)
+     else:
+         st = next((x[1] for x in dec.kept if id(x[1]) not in busy and (best is None or x[1] is not best[1])), None)
+         if st is None:
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/multi.py b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+index 3e0ce68..7132a71 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/multi.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -11,6 +11,7 @@ from tensorfold.cuda.logprobs import capture
+ 
+ from tensorfold.cuda.capacity import LIMIT_ENV, available_bytes, cuda_limit_bytes
+ from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, torch_live
++from tensorfold.cuda import keep_rank
+ from tensorfold.cuda.markers import MIN_GAP
+ from tensorfold.cuda.sampling import sample_streams
+ from tensorfold.cuda.streams import Stream, accept
+@@ -48,6 +49,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+     """Rounds over the live streams; ``slots`` streams at most, each with ``capacity`` tokens of context."""
+ 
+     store = None                     # the prompt store on disk (patch 0006); set by __init__ when it is on
++    unsaved = ()                     # patch 0010 (set by __init__): points waiting in their slot for the disk queue
++    conts = None                     # patch 0010 (set by __init__): point -> continuations resumed from it
+ 
+     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
+                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
+@@ -94,11 +97,15 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         self.keep = keep
+         # kept points also go to disk and come back from it (TF_PROMPT_CACHE_DIR; one GPU)
+         self.store = disk_points.open_store(self) if w.comm is None else None
++        self.unsaved: list = []          # patch 0010: kept points waiting in their slot for room in the disk queue
++        self.conts: dict = {}            # patch 0010: point -> the continuations requests resumed it with
+ 
+     def _busy(self) -> set[int]:
+         return {id(s.st) for s in [*self.streams.values(), *self.filling]}
+ 
+     def _drop_kept(self, st: State) -> None:
++        if self.unsaved:
++            disk_points.flush(self, st)          # patch 0010: its points waiting for the disk queue are copied first
+         self.kept = [k for k in self.kept if k[1] is not st]
+ 
+     def _grow(self, st: State, rows: int, *, alone: bool = False, protect: State | None = None) -> bool:
+@@ -150,6 +157,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+     def _shrink(self, st: State, *, release: bool = False, force: bool = False) -> None:
+         """Return idle caches to the gate, retaining the graph slot unless memory or cleanup requires its release."""
+ 
++        if self.unsaved:
++            disk_points.flush(self, st)
+         st.reset(self.w)
+         if force or st.capacity > FIRST and (release or not self._is_solo(st)):
+             self._state_changed(st)
+@@ -159,7 +168,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         """Free the oldest idle kept prompt end (never ``keep``); False when none is left."""
+ 
+         busy = self._busy()
+-        for ids, st, _, _ in self.kept:
++        for st in prefixes.slot_order(self):     # patch 0010: history points' slots first, shared starting points last
+             if st is not keep and st is not protect and id(st) not in busy:
+                 self._drop_kept(st)
+                 self._shrink(st, release=True)
+@@ -216,9 +225,16 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         if self.solo is not None and any(st is self.solo.st for st in self.free):
+             self.free = [st for st in self.free if st is not self.solo.st] + [self.solo.st]
+         store = self.store if reuse and cache_key is None and not self.planning else None
++        if self.unsaved and not self.planning:
++            for st in list(self.free):           # a free slot is reused next: its waiting points are copied now
++                disk_points.flush(self, st)
+         if store is not None:
+             disk_points.restore(self, prompt, prefixes._best(self.kept, prompt))
+         got = prefixes.slot_for(self, prompt, reuse, cache_key=cache_key)
++        if self.unsaved and not self.planning:
++            disk_points.flush(self, got[0], got[1] is not None and got[2] or 0)   # rows past the resume get rewritten
++        if got[2] and not self.planning and self.conts is not None:
++            keep_rank.note(self.conts, prompt, got[2], [k[0] for k in self.kept])
+         if store is not None and got[2]:
+             store.used(store.prefix(prompt), got[2])
+         return got
+@@ -233,6 +249,10 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+                 self.store.stats["errors"] += 1
+                 print(f"[prompt-cache] save failed: {type(exc).__name__}: {exc}", flush=True)
+         prefixes.remember(self, ids, st, snap, tail)
++        if self.unsaved and not self.planning:
++            for f in list(self.free):            # dropped from the kept points: copied before the slot is reused
++                disk_points.flush(self, f)
++            disk_points.retry(self)
+ 
+     def live(self) -> int:
+         return len(self.streams) + len(self.filling)
+@@ -328,6 +348,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+         else:
+             ended, solo_sid = self._make_room(), None
+             self.pass_plan = self.mixed_plan = None
++        if self.unsaved and not self.planning:
++            disk_points.retry(self)              # patch 0010: as soon as the disk queue has room
+         live = [s for s in self.streams.values() if not s.done and not s.waiting]
+         if self.filling and (not live or not self.converged):
+             ended += self._fill()                      # passes alone; a prompt that ends here joins this round
+@@ -542,6 +564,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
+             if not any(k[1] is s.st for k in self.kept) and all(f is not s.st for f in self.free):
+                 self._shrink(s.st)
+                 self.free.append(s.st)
++        if self.unsaved and not self.streams and not self.filling and not self.planning:
++            disk_points.retry(self, force=True)  # patch 0010: idle: nothing to stall, every waiting point is copied
+ 
+     def drop(self) -> list[Stream]:
+         if self.link is not None:
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/prefixes.py b/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
+index 507b06d..54ce2d4 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/prefixes.py
+@@ -1,5 +1,27 @@
+ """Select and retain prompt prefixes without consuming a longer chain when a spare slot can hold a copy."""
+ 
++from tensorfold.cuda import keep_rank
++
++
++def _ranks(owner) -> list[int]:
++    """``keep_rank`` ranks of ``owner.kept`` (patch 0010): history points first, shared starting points last."""
++
++    conts = getattr(owner, "conts", None) or {}
++    waiting = getattr(owner, "unsaved", None) or ()
++    return keep_rank.ranks([k[0] for k in owner.kept], [len(conts.get(keep_rank.point_key(k[0]), ())) for k in owner.kept],
++                           [any(u[2] is k[1] and len(u[1]) == len(k[0]) for u in waiting) for k in owner.kept])
++
++
++def slot_order(owner) -> list:
++    """The kept slots, the one to free first first: its best point's rank lowest, then its oldest point oldest."""
++
++    r = _ranks(owner)
++    best: dict[int, tuple] = {}
++    for i, k in enumerate(owner.kept):
++        old = best.get(id(k[1]))
++        best[id(k[1])] = (max(r[i], old[0]), min(i, old[1]), k[1]) if old else (r[i], i, k[1])
++    return [v[2] for v in sorted(best.values(), key=lambda v: (v[0], v[1]))]
++
+ 
+ def _best(kept, prompt, busy=(), cache_key=None):
+     return max((k for k in kept if id(k[1]) not in busy and len(k[0]) < len(prompt)
+@@ -54,14 +76,11 @@ def remember(owner, ids, st, snap, tail) -> None:
+     gone = [k[1] for k in owner.kept if same(k)]
+     owner.kept = [k for k in owner.kept if not same(k)] + [(ids, st, snap, tail)]
+     while len(owner.kept) > owner.keep:
+-        # Over the cap, an older point of a slot that keeps a newer one goes first (a message start inside a
+-        # conversation's history), so every slot keeps its latest point (where its conversation resumes) for as long
+-        # as any slot has an older one to give; then the oldest. Before, the oldest went first, so with more
+-        # conversations than half the cap their latest points went too and their next turns prefilled from scratch.
+-        per = {}
+-        for k in owner.kept:
+-            per[id(k[1])] = per.get(id(k[1]), 0) + 1
+-        at = next((i for i, k in enumerate(owner.kept) if per[id(k[1])] > 1), 0)
++        # Over the cap (patch 0010, ``keep_rank``): a point inside a conversation's history goes first (it is on disk),
++        # then a conversation's newest point, then a shared starting point (a reused system prompt, a fork's base);
++        # the oldest first within each, and a point not yet copied for the disk last of all.
++        r = _ranks(owner)
++        at = min(range(len(owner.kept)), key=lambda i: (r[i], i))
+         gone.append(owner.kept.pop(at)[1])
+     busy = owner._busy()
+     for old in gone:
+diff --git a/tests/cuda/test_prompt_store.py b/tests/cuda/test_prompt_store.py
+index b364eb5..1186184 100644
+--- a/tests/cuda/test_prompt_store.py
++++ b/tests/cuda/test_prompt_store.py
+@@ -49,6 +49,7 @@ class _Dec:
+     def __init__(self, w, kv, slots=2, cap=8192):
+         self.free = [State(w, cap, 4, kv) for _ in range(slots)]
+         self.kept, self.streams, self.filling, self.depth = [], {}, [], 3
++        self.unsaved, self.conts = [], {}
+         self.store = disk_points.open_store(self)
+ 
+     def _busy(self):
+@@ -206,3 +207,128 @@ def test_points_at_last_message_starts(monkeypatch):
+     assert starts[1] in got and starts[3] in got and starts[4] in got      # system, the last user message, the reply
+     monkeypatch.setattr(markers, "LAST", 0)
+     assert starts[3] not in points(ids)
++
++
++def test_points_at_every_message_start(monkeypatch):
++    """Patch 0010: TF_POINTS_LAST=all keeps a point at every message start, and every start has a point at most
++    MIN_GAP tokens before it (two starts closer than that: the earlier one stays)."""
++    from tensorfold.cuda import markers
++    monkeypatch.setattr(markers, "LAST", -1)
++    opener, asst = 1, 2
++    points = markers.snapshot_points([opener], [opener, asst])
++    sizes = [700, 300, 20, 900, 15, 30, 500, 10, 400, 260]                 # tiny messages among long ones
++    ids = [opener, 9] + [5] * 600
++    for i, n in enumerate(sizes):
++        ids += [opener, asst if i % 2 else 9] + [5] * n
++    ids += [opener, asst]
++    starts = [i for i, t in enumerate(ids) if t == opener][1:]
++    got = points(ids)
++    assert all(b - a >= markers.MIN_GAP for a, b in zip(got, got[1:]))
++    for s in starts:
++        assert any(s - markers.MIN_GAP < p <= s for p in got), (s, got)
++    long_ones = [s for s, n in zip(starts, [600] + sizes) if n >= markers.MIN_GAP]
++    assert set(long_ones) <= set(got)                                       # after a long message: exactly there
++    monkeypatch.setattr(markers, "LAST", 3)
++    assert len(points(ids)) < len(got)
++    monkeypatch.setattr(markers, "LAST", -1)
++    monkeypatch.setattr(markers, "GAP", 1024)                               # older starts thinned, last 3 kept
++    thin = points(ids)
++    assert len(thin) < len(got) and set(got[-3:]) <= set(thin)
++    assert all(b - a >= 1024 for a, b in zip(thin[:-3], thin[1:-3]))
++
++
++def test_full_queue_defers_never_drops(env, monkeypatch):
++    """Patch 0010: past the queue's cap a point waits in its GPU slot, is copied when the queue has room (retry) or at
++    once when its slot is needed (flush), and is never dropped."""
++    monkeypatch.setenv("TF_PROMPT_CACHE_QUEUE_GIB", "1e-9")
++    w = _weights()
++    a = _Dec(w, "bf16", slots=3)
++    store = a.store
++    sts = [a.free.pop() for _ in range(3)]
++    snaps = []
++    for j, st in enumerate(sts):
++        _fill(st, 1300 + j, j)
++        ids = list(range(10 * j, 10 * j + 1300 + j))
++        snaps.append((ids, {**st.snapshot(), "mtp_len": 1299 + j}))
++    store.queued = store.queue_cap                                          # the writer is behind
++    for st, (ids, snap) in zip(sts, snaps):
++        disk_points.capture(a, ids, st, snap, None)
++    assert len(a.unsaved) == 3 and store.stats["deferred"] == 3 and store.stats["dropped"] == 0
++    disk_points.flush(a, sts[1])                                           # slot 1 is about to be reused
++    assert len(a.unsaved) == 2 and store.stats["forced"] == 1
++    disk_points.retry(a)                                                    # still full: nothing moves
++    assert len(a.unsaved) == 2
++    _drain(store)
++    store.queued -= store.queue_cap
++    store.queue_cap = 1 << 40                                               # room again
++    disk_points.retry(a)
++    assert not a.unsaved
++    _drain(store)
++    assert len(store.points) == 3 and store.stats["lost"] == 0 and not store.deferred
++
++
++def test_journal_counts_points_lost_at_a_kill(env):
++    w = _weights()
++    a = _Dec(w, "bf16")
++    st = a.free[0]
++    _fill(st, 1200, 3)
++    ids = list(range(1200))
++    a._remember(ids, st, {**st.snapshot(), "mtp_len": 1199}, None)
++    _drain(a.store)
++    a.store._journal("q deadbeef 4096")                                     # queued, then the process was killed
++    a.store.defer("cafe", 512)                                              # waited in a GPU slot, never copied
++    b = _Dec(w, "bf16")
++    assert b.store.stats["lost_before"] == 2 and len(b.store.points) == 1
++    c = _Dec(w, "bf16")                                                     # counted once
++    assert c.store.stats["lost_before"] == 0
++
++
++def test_close_waits_for_the_writer(env):
++    w = _weights()
++    a = _Dec(w, "bf16")
++    st = a.free[0]
++    _fill(st, 3000, 4)
++    a._remember(list(range(3000)), st, {**st.snapshot(), "mtp_len": 2999}, None)
++    a.store.close()
++    assert len(a.store.points) == 1 and a.store.stats["lost"] == 0
++    assert json.loads((env / a.store.key / "stats.json").read_text())["saved"] == 1
++
++
++def test_keep_rank():
++    from tensorfold.cuda import keep_rank
++    keep_rank.OPENERS = np.array([1])
++    sys_ = [1, 7, 7]                                                        # a system prompt's point
++    a1, a2 = sys_ + [1, 8], sys_ + [1, 8, 8, 1, 8]                          # conversation A: history, newest
++    b1 = sys_ + [1, 9]                                                      # conversation B: newest
++    ids = [sys_, a1, a2, b1]
++    r = keep_rank.ranks(ids, [0, 0, 0, 0], [False] * 4)
++    assert r == [2, 0, 1, 1]                                                # sys_: base of 2 diverging chains
++    r = keep_rank.ranks([sys_, a1, a2], [0, 0, 0], [False] * 3)
++    assert r == [0, 0, 1]                                                   # one conversation: history points
++    r = keep_rank.ranks([sys_, a1, a2], [1, 0, 0], [False] * 3)
++    assert r[0] == 2                                                        # a first-message point resumed from
++    r = keep_rank.ranks([sys_, a1, a2], [0, 2, 0], [False, False, True])
++    assert r == [0, 2, 3]                                                   # 2 continuations; unsaved last
++    assert keep_rank.victim(ids, [0, 0, 0, 0], [False] * 4) == 1
++    conts = {}
++    keep_rank.note(conts, a2 + [5], len(a1))
++    keep_rank.note(conts, a1 + [6, 6], len(a1))
++    assert len(conts[keep_rank.point_key(a1)]) == 2
++
++
++def test_gpu_points_keep_shared_starts(monkeypatch):
++    """Flash's kept points over the cap: history points go first, then one-off ends; a shared start stays."""
++    from tensorfold.cuda import keep_rank
++    from tensorfold.families.qwen4_exp.cuda import prefixes
++    keep_rank.OPENERS = np.array([1])
++    slots = [object() for _ in range(6)]
++    owner = SimpleNamespace(kept=[], keep=3, free=[], conts={}, unsaved=[], _busy=lambda: set())
++    sys_ = [1] + [7] * 300
++    prefixes.remember(owner, sys_, slots[0], {}, None)
++    keep_rank.note(owner.conts, sys_ + [1, 5], len(sys_))                   # two conversations started from it
++    keep_rank.note(owner.conts, sys_ + [1, 6], len(sys_))
++    for i in range(1, 6):                                                   # five one-off conversations' ends
++        prefixes.remember(owner, sys_ + [1, 10 + i] + [3] * 50, slots[i], {}, None)
++    kept = [k[0] for k in owner.kept]
++    assert sys_ in kept and len(kept) == 3
++    assert [k[1] for k in owner.kept][1:] == slots[4:]                      # the newest ends stay
+-- 
+2.43.0
+
