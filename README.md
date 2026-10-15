@@ -48,8 +48,6 @@ yeasah's published KLD vs bf16 (noise floor 0.0042):
 | 5.00bpw | 22.6 GiB | 0.0063 | 10.104 |
 | **6.00bpw** | **26.5 GiB** | **0.0049** | **10.097** |
 
-Switch: `local/pin-weights.sh 5.00bpw && local/download.sh`.
-
 ## Speed
 
 - Prefill ~3.7-4.3k tok/s alone, ~3.5-4.2k total at 2-8 prompts.
