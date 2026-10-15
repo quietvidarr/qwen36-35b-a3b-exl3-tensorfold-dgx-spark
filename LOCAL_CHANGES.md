@@ -5,20 +5,19 @@ No upstream recipe. Built on:
 | What | From | Pinned in |
 |---|---|---|
 | Image `qwen38-flash-next-tensorfold:609ca419` | Flash recipe (souf's `scripts/build_tensorfold.sh`) | `local/pins.env` `BASE_IMAGE`, `TENSORFOLD_REV` |
-| Patches 0001-0010 | verbatim copies of the Flash recipe's | the files |
-| Patches 0101-0125 | ours, this model | the files |
+| TensorFold source | [quietvidarr/TensorFold-spark@3d7221cb](https://github.com/quietvidarr/TensorFold-spark/commit/3d7221cb416e665a63faf4f55d76f48d396b930c) (both models; same commit as the Flash recipe) | `local/pins.env` `TENSORFOLD_FORK_REV` |
 | Weights | `yeasah/Qwen3.6-35B-A3B-exl3` `6.00bpw` | `local/pins.env`, `local/manifest.json` |
 
 ## Update
 
 ```bash
 local/check-update.sh       # read-only. 0 = ok, 3 = incompatible, 1 = check failed
-local/update.sh             # re-checks; if ok: copy Flash patches 00*, update pins, commit, build
+local/update.sh             # re-checks; if ok: follow Flash's pins, commit, build
 local/download.sh --follow  # re-pin weights to newest revision (~27 GB)
 ```
-Check compares the Flash recipe's image/revision and patches, then applies the whole stack on its pinned revision.
+Check compares the Flash recipe's image, TensorFold revision and fork commit with ours; a new fork commit must contain ours.
 Flash base image must be built first. Rollback: `git revert HEAD && local/build.sh`.
-Incompatible: rebase our `01*.patch`, commit, re-check.
+Incompatible: fix the fork (`spark`), pin the commit in both recipes, re-check.
 
 ## Recipe (`local/`)
 
@@ -28,20 +27,20 @@ Incompatible: rebase our `01*.patch`, commit, re-check.
 | `config.sh` | Settings; `.env` overrides. Name `Qwen3.6-35B-A3B-EXL3-<branch>-TensorFold`, 127.0.0.1:8001 |
 | `start.sh`, `stop.sh` | Named container, host network, `--restart no`, kept when stopped; 112 GiB cap, read-only root, non-root |
 | `serve_local.py` | Runs `tensorfold serve`; profiler `TF_PROFILE=1` |
-| `Dockerfile`, `build.sh` | `BASE_IMAGE` + patches + `serve_local.py`, offline; CPU import check |
+| `Dockerfile`, `build.sh`, `tensorfold-src.sh` | `BASE_IMAGE` + fork tree at `TENSORFOLD_FORK_REV` + `serve_local.py`; CPU import check |
 | `prebuild.sh` | Compile CUDA extensions on CPU (sm_121) |
 | `download.sh`, `hf-download.sh`, `verify_weights.py` | Resumable download (curl), sha256-verified |
 | `image.sh` | "Update available" = image not built |
 | `check-update.sh`, `update.sh` | Safe update |
 | `router-entry.json` | Router models.json entry |
 
-## TensorFold patches (applied in name order)
+## TensorFold changes
 
-Each file has a header with details.
+TensorFold changes live in [quietvidarr/TensorFold-spark@3d7221cb](https://github.com/quietvidarr/TensorFold-spark/commit/3d7221cb416e665a63faf4f55d76f48d396b930c). Numbers = the former patch files; details in its `CHANGES.md`.
 
 | # | Change |
 |---|---|
-| 0001-0010 | Flash recipe's, unchanged (0001/0003/0009 inert here) |
+| 0001-0010 | Shared with the Flash recipe (0001/0003/0009 inert here) |
 | 0101 | EXL3 for Qwen3.6-35B-A3B on CUDA (`qwen3_5_moe/cuda/exl3.py`): dense + experts + MTP. Was MLX 4-bit only |
 | 0102 | Prompt expert kernel in 256-column strips (320 doesn't divide 512/2048) |
 | 0103 | Each conversation keeps its latest state (`KeptEnds`); `TF_KEEP` → `--checkpoint-slots` |
@@ -57,18 +56,9 @@ Each file has a header with details.
 Untouched: Flash Next path (`qwen4_exp`), 27B path, other families.
 Rollback: `TF_LOCAL_IMAGE=<older tag>` in `.env`.
 
-## Rebase onto new TensorFold
+## New TensorFold
 
-```bash
-F=<path to Flash recipe>
-d=$(mktemp -d); git -C $d init -q; git -C $d remote add origin https://github.com/ashhart/TensorFold.git
-git -C $d fetch -q --depth 1 origin <NEW_REV>; git -C $d checkout -q FETCH_HEAD
-git -C $d apply $F/patches/*.patch $F/local/patches/tensorfold/*.patch
-git -C $d add -A; git -C $d -c user.name=x -c user.email=x commit -qm base
-for p in local/patches/tensorfold/01*.patch; do
-  git -C $d apply --3way $p && git -C $d add -A && git -C $d -c user.name=x -c user.email=x commit -qm "$p"
-done
-```
+Rebase the fork's `spark` onto it, push, pin the new commit in both recipes' `local/pins.env`.
 
 ## Tests
 

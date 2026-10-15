@@ -6,7 +6,7 @@ Qwen3.6-35B-A3B in EXL3, served by TensorFold 0.6.5 on one GB10. OpenAI API on 1
 
 - Recipe base: souf, [sxuff/qwen38-flash-next-dgx-spark](https://github.com/sxuff/qwen38-flash-next-dgx-spark) (MIT, © 2026 souf): TensorFold base image, `vision-prefix-cache.patch`.
 - Weights: [yeasah/Qwen3.6-35B-A3B-exl3](https://huggingface.co/yeasah/Qwen3.6-35B-A3B-exl3).
-- Engine: [ashhart/TensorFold](https://github.com/ashhart/TensorFold) (Apache-2.0). Our patches: [quietvidarr/TensorFold-spark](https://github.com/quietvidarr/TensorFold-spark).
+- Engine: [ashhart/TensorFold](https://github.com/ashhart/TensorFold) (Apache-2.0). TensorFold changes live in [quietvidarr/TensorFold-spark@3d7221cb](https://github.com/quietvidarr/TensorFold-spark/commit/3d7221cb416e665a63faf4f55d76f48d396b930c).
 
 ## Requirements
 
@@ -18,7 +18,7 @@ Qwen3.6-35B-A3B in EXL3, served by TensorFold 0.6.5 on one GB10. OpenAI API on 1
 
 ```bash
 local/download.sh   # weights, resumable, sha256-verified
-local/build.sh      # our image, offline
+local/build.sh      # our image: base + fork at the pinned commit
 local/prebuild.sh   # optional: compile CUDA extensions now
 local/start.sh      # serves on 127.0.0.1:8001
 local/stop.sh
@@ -36,7 +36,7 @@ local/stop.sh
 | `PROMPT_CACHE_DIR` | `~/.cache/tensorfold-prompt-cache` | SSD prompt cache, shared with Flash; empty = off |
 | `FLASH_RECIPE` | `../qwen38-flash-next-dgx-spark` | Flash recipe clone (base image, update check) |
 | `HF_HUB_CACHE` | `~/.cache/huggingface/hub` | weights |
-| `TENSORFOLD_SRC_CACHE` | `.cache/tensorfold-src` | sources for `check-update.sh` |
+| `TENSORFOLD_SRC` | `.cache/TensorFold-spark` | fork clone used by `build.sh`; `GH_TOKEN` while the fork is private |
 | `TF_LOCAL_IMAGE` | — | pin an older image (rollback) |
 
 | `TF_KEEP` | 3 | 8 | 12 | 16 |
