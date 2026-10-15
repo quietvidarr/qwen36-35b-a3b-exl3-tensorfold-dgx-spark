@@ -1,0 +1,59 @@
+From 4632c461fddd09ec4a132f46c4afab69e8647c50 Mon Sep 17 00:00:00 2001
+From: quietvidarr <343052645+quietvidarr@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 09:17:56 +0200
+Subject: [PATCH] 0205-qwen36-prompt-sum-mode-tests
+
+---
+ tests/cuda/test_exl3_prompt_strips.py |  2 +-
+ tests/cuda/test_qwen36_exl3_moe.py    | 10 +++++++---
+ 2 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/tests/cuda/test_exl3_prompt_strips.py b/tests/cuda/test_exl3_prompt_strips.py
+index b8dbc7e..eebe92a 100644
+--- a/tests/cuda/test_exl3_prompt_strips.py
++++ b/tests/cuda/test_exl3_prompt_strips.py
+@@ -62,7 +62,7 @@ def test_narrow_rows_independent_of_window():
+     x = (0.5 * torch.randn((R, D), device="cuda", generator=g)).bfloat16()
+     s = X.Scratch(ex, R, top + 1)
+     det = X.PROMPT_DET
+-    X.PROMPT_DET = True                               # the fixed slot order (lab patch 0201's default adds them freely)
++    X.PROMPT_DET = "grid"                             # deterministic (the default; "0" adds the slots freely)
+     try:
+         whole = torch.empty((R, D), dtype=torch.float32, device="cuda")
+         X.routed(x, pick, wts, ex, s, whole, R, prompt=True, summed=True)
+diff --git a/tests/cuda/test_qwen36_exl3_moe.py b/tests/cuda/test_qwen36_exl3_moe.py
+index 23eb12c..866009b 100644
+--- a/tests/cuda/test_qwen36_exl3_moe.py
++++ b/tests/cuda/test_qwen36_exl3_moe.py
+@@ -47,13 +47,17 @@ def test_prompt_rows_independent_of_window_and_close_to_decode():
+     m, g = _routed()
+     x = torch.randn((3000, 2048), device="cuda", generator=g).bfloat16()
+     det = X.PROMPT_DET
+-    X.PROMPT_DET = True                               # the fixed slot order (lab patch 0201's default adds them freely)
++    X.PROMPT_DET = "grid"                             # deterministic (the default; "0" adds the slots freely)
+     try:
+         prompt = moe.run(x, m, prefill=True)
+         assert torch.equal(moe.run(x[1000:2500].contiguous(), m, prefill=True), prompt[1000:2500])
+     finally:
+         X.PROMPT_DET = det
+-    free = moe.run(x, m, prefill=True)                # bf16 roundings of fp32 sums in another order: rare 1-ulp flips
++    X.PROMPT_DET = "0"
++    try:
++        free = moe.run(x, m, prefill=True)            # bf16 roundings of fp32 sums in another order: rare 1-ulp flips
++    finally:
++        X.PROMPT_DET = det
+     assert ((free.float() - prompt.float()).abs() > 0).float().mean().item() < 0.02
+     decode = moe.run(x[:128].contiguous(), m)
+     rel = ((prompt[:128].float() - decode.float()).norm() / decode.float().norm()).item()
+@@ -68,7 +72,7 @@ def test_head_takes_prompt_kernel_for_wide_rows():
+     m, g = _routed(wide_prompt=True)
+     x = torch.randn((600, 2048), device="cuda", generator=g).bfloat16()
+     det = X.PROMPT_DET
+-    X.PROMPT_DET = True                               # the fixed slot order (lab patch 0201's default adds them freely)
++    X.PROMPT_DET = "grid"                             # deterministic (the default; "0" adds the slots freely)
+     try:
+         assert torch.equal(moe.run(x, m), moe.run(x, m, prefill=True))
+     finally:
+-- 
+2.43.0
+

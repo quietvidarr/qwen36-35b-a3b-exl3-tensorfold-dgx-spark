@@ -1,0 +1,219 @@
+From 592a21ed522e0211d0ffb20412c3742ed632cfc0 Mon Sep 17 00:00:00 2001
+From: quietvidarr <343052645+quietvidarr@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 09:19:22 +0200
+Subject: [PATCH] 0002-qwen3.6-multi-stream-defer-the-GDN-replay-into-the-n
+
+---
+ .../families/qwen3_5/cuda/forward.py          | 64 ++++++++++++++++---
+ .../families/qwen3_5_moe/cuda/multi.py        | 44 +++++++++++--
+ 2 files changed, 94 insertions(+), 14 deletions(-)
+
+diff --git a/src/tensorfold/families/qwen3_5/cuda/forward.py b/src/tensorfold/families/qwen3_5/cuda/forward.py
+index aae18b5..3efbe18 100644
+--- a/src/tensorfold/families/qwen3_5/cuda/forward.py
++++ b/src/tensorfold/families/qwen3_5/cuda/forward.py
+@@ -304,8 +304,12 @@ def tree_forward(w: Weights, tokens: torch.Tensor, parents: Sequence[int], st: S
+ @torch.no_grad()
+ def multi_tree_forward(w: Weights, streams: Sequence[tuple[Sequence[int], Sequence[int], State]], *,
+                        full_logits: bool = True, tp: bool = False, capture_taps: bool = False,
+-                       hidden: bool = False):
+-    """Several streams' windows in one forward, each row with the bits of its stream's own ``tree_forward`` (``hidden``: the rows' final normed states third)."""
++                       hidden: bool = False, pending: tuple | None = None):
++    """Several streams' windows in one forward, each row with the bits of its stream's own ``tree_forward`` (``hidden``: the rows' final normed states third).
++
++    ``pending`` (record, rows a stream): the accepted rows of the previous forward's ``record`` that ``commit_streams(...,
++    defer=True)`` left out of each stream's DeltaNet states; the tree kernel steps them in first (the same steps as the
++    replay, in place), so the states and outputs have the bits of an eager commit."""
+ 
+     c = w.config
+     device = w.norm.device
+@@ -339,14 +343,28 @@ def multi_tree_forward(w: Weights, streams: Sequence[tuple[Sequence[int], Sequen
+     S = len(states)
+     attn_flat, attn_items, attn_chunks = tree_attention.plan_host(local, [st.pos for st in states],
+                                                                   c.heads // c.kv_heads)
+-    host = torch.tensor(positions + sids + entries + starts + ids + [i for win in windows for i in win] + attn_flat,
+-                        dtype=torch.int32).pin_memory()
++    pend_flat: list[int] = []
++    if pending is not None:
++        prev, prows = pending
++        pw = prev[0].k.shape[0]
++        for rows in prows:
++            pend_flat += list(rows) + [0] * (pw - len(rows)) + [len(rows)]
++    host = torch.tensor(positions + sids + entries + starts + ids + [i for win in windows for i in win] + pend_flat
++                        + attn_flat, dtype=torch.int32).pin_memory()
+     dev = host.to(device, non_blocking=True)            # one copy, and the host runs on
+     pos, sid_t = dev[:W], dev[W:2 * W]
+     plan = deltanet.Plan(dev[2 * W:5 * W].view(W, 3), dev[5 * W:5 * W + S + 1], slots, most)
+     ids_t = dev[5 * W + S + 1:6 * W + S + 1]
+     windows_t = dev[6 * W + S + 1:6 * W + S + 1 + W * (keep + 1)].view(W, keep + 1)
+-    aplan = tree_attention.from_packed(dev[6 * W + S + 1 + W * (keep + 1):], S, W, attn_items, attn_chunks)
++    at = 6 * W + S + 1 + W * (keep + 1)
++    pend_args = {}
++    if pending is not None:
++        packed = dev[at:at + len(pend_flat)].view(S, pw + 1)
++        at += len(pend_flat)
++        for j, item in enumerate(prev):
++            if isinstance(item, GDNRecord):
++                pend_args[j] = [item.k, item.v, item.g, item.beta, packed[:, :pw], packed[:, pw]]
++    aplan = tree_attention.from_packed(dev[at:], S, W, attn_items, attn_chunks)
+     x = glue.embedding(ids_t, w.embed)
+     pending: torch.Tensor | None = None
+     record: list[Record] = []
+@@ -367,7 +385,7 @@ def multi_tree_forward(w: Weights, streams: Sequence[tuple[Sequence[int], Sequen
+             conv = states[0].conv[i] if S == 1 else torch.cat([st.conv[i] for st in states])
+             q, k, v, g, beta = glue.gdn_pre(qkv, conv, gdn.conv, windows_t, a, b, gdn.A_log, gdn.dt_bias,
+                                             kh=c.k_heads, vh=c.v_heads, dk=c.dk, stream_ids=sid_t, nkeep=keep)
+-            yr = deltanet.tree(q, k, v, g, beta, plan, table=tables[i])
++            yr = deltanet.tree(q, k, v, g, beta, plan, table=tables[i], pending=pend_args.get(i))
+             out, out_xs = glue.gated_norm(yr, z, gdn.norm, c.eps)
+             r = _row_mm(out, gdn.out, tp, out_xs)
+             record.append(GDNRecord(q, k, v, g, beta, qkv))
+@@ -427,25 +445,51 @@ def commit(st: State, record: Sequence[Record], path: Sequence[int], indices: tu
+ 
+ 
+ def commit_streams(states: Sequence[State], record: Sequence[Record], paths: Sequence[Sequence[int]],
+-                   indices: list | None = None, *, in_place: bool = False) -> None:
+-    """Commit each stream's accepted path into its own state with one GDN replay launch for every stream (``in_place``: states nothing else holds)."""
++                   indices: list | None = None, *, in_place: bool = False, defer: bool = False) -> None:
++    """Commit each stream's accepted path into its own state with one GDN replay launch for every stream (``in_place``: states nothing else holds).
++
++    ``defer`` (with ``in_place``): the DeltaNet states are left for the next ``multi_tree_forward(pending=...)`` or
++    ``replay_pending`` to step (conv windows and attention caches are committed now)."""
+ 
+     indices = indices if indices is not None else path_indices(record, paths)
+     width = record[0].k.shape[0]
+     packed = indices[0][0].as_strided((len(paths), width + 1), (width + 1, 1))    # path_indices' one copy
+-    _commit(states, record, paths, packed[:, :width], packed[:, width], [t for _, _, t in indices], in_place)
++    _commit(states, record, paths, packed[:, :width], packed[:, width], [t for _, _, t in indices], in_place,
++            defer=defer)
++
++
++def replay_pending(states: Sequence[State], record: Sequence[Record], rows: Sequence[Sequence[int]]) -> None:
++    """Step deferred rows (``commit_streams(defer=True)``) into the states in place: one replay launch."""
++
++    linear = [(i, item) for i, item in enumerate(record) if isinstance(item, GDNRecord)]
++    if not linear or not states:
++        return
++    items = [item for _, item in linear]
++    width = record[0].k.shape[0]
++    flat: list[int] = []
++    for r in rows:
++        flat += list(r) + [0] * (width - len(r)) + [len(r)]
++    dev = deltanet.to_device(flat, torch.int32, items[0].k.device).view(len(states), width + 1)
++    ptrs = deltanet.replay_table([t.k for t in items], [t.v for t in items], [t.g for t in items],
++                                 [t.beta for t in items], [[st.rec[i] for i, _ in linear] for st in states])
++    table = deltanet.to_device(ptrs, torch.int64, items[0].k.device)
++    deltanet.replay(table, len(items), len(states), dev[:, :width], dev[:, width], items[0].k, items[0].v,
++                    in_place=True)
+ 
+ 
+ def _commit(states: Sequence[State], record: Sequence[Record], paths: Sequence[Sequence[int]], rows: torch.Tensor,
+-            counts: torch.Tensor, takes: Sequence[torch.Tensor], in_place: bool = False) -> None:
++            counts: torch.Tensor, takes: Sequence[torch.Tensor], in_place: bool = False, defer: bool = False) -> None:
+     if any(not p for p in paths) or any(len(record) != len(st.rec) for st in states):
+         raise ValueError("record and nonempty paths required")
+     # one GDN replay launch covers every layer and stream
+     linear = [(i, item) for i, item in enumerate(record) if isinstance(item, GDNRecord)]
+     att = [(i, item) for i, item in enumerate(record) if not isinstance(item, GDNRecord)]
+     replayed = None
++    if defer and not in_place:
++        raise ValueError("a deferred commit steps the states in place")
+     if linear:
+         items = [item for _, item in linear]
++    if linear and not defer:
+         ptrs = deltanet.replay_table([t.k for t in items], [t.v for t in items], [t.g for t in items],
+                                      [t.beta for t in items], [[st.rec[i] for i, _ in linear] for st in states])
+         table = deltanet.to_device(ptrs, torch.int64, rows.device)
+diff --git a/src/tensorfold/families/qwen3_5_moe/cuda/multi.py b/src/tensorfold/families/qwen3_5_moe/cuda/multi.py
+index 13fe28e..7d5f7d7 100644
+--- a/src/tensorfold/families/qwen3_5_moe/cuda/multi.py
++++ b/src/tensorfold/families/qwen3_5_moe/cuda/multi.py
+@@ -14,7 +14,7 @@ from tensorfold.cuda.streams import PrefixCache, Stream, accept, next_fill
+ from tensorfold.engine.grammar import GrammarError
+ from tensorfold.families.qwen3_5.cuda.decode import CopyIndex
+ from tensorfold.families.qwen3_5.cuda.engine import entry_end
+-from tensorfold.families.qwen3_5.cuda.forward import State, _mm, commit_streams, multi_tree_forward
++from tensorfold.families.qwen3_5.cuda.forward import State, _mm, commit_streams, multi_tree_forward, replay_pending
+ from tensorfold.families.qwen3_5.cuda.multi import kept, private
+ 
+ from tensorfold.cuda import keep_rank
+@@ -24,6 +24,8 @@ from .decode import COPY_ROWS, Carry, extend, mtp_round, picks
+ from .mtp import Cache, Head
+ 
+ STEP = int(os.environ.get("TF_PREFILL_STEP", "1024"))   # prompt rows a prefill step takes while other streams decode
++# a round's accepted DeltaNet rows are stepped into the states by the next round's tree kernel (no replay pass)
++DEFER = os.environ.get("TF_QWEN36_GDN_DEFER", "1") != "0"
+ 
+ 
+ class KeptEnds(PrefixCache):
+@@ -223,7 +225,7 @@ class MultiDecoder:
+         wins = [[s.out[-1]] + s.drafts for s in live]
+         chains = [list(range(-1, len(t) - 1)) for t in wins]
+         logits, record, hidden, starts = multi_tree_forward(
+-            self.w, [(t, p, s.st) for t, p, s in zip(wins, chains, live)], hidden=True)
++            self.w, [(t, p, s.st) for t, p, s in zip(wins, chains, live)], hidden=True, pending=self._pending(live))
+         for k, s in enumerate(live):                  # a constrained stream's rows, each masked by its path
+             if s.sid in grammars:
+                 s.constraint.mask(logits[starts[k]:starts[k + 1]], grammars[s.sid])
+@@ -231,8 +233,12 @@ class MultiDecoder:
+         sampled = sample_streams(logits, starts, positions, [s.sampling for s in live])
+         kept_rows = [accept(t, p, rows, s.count - len(s.out), self._ends(s))
+                      for s, t, p, rows in zip(live, wins, chains, sampled)]
+-        commit_streams([s.st for s in live], record, [[starts[k] + r for r in path]
+-                                                      for k, (path, _) in enumerate(kept_rows)], in_place=True)
++        paths = [[starts[k] + r for r in path] for k, (path, _) in enumerate(kept_rows)]
++        commit_streams([s.st for s in live], record, paths, in_place=True, defer=DEFER)
++        if DEFER:
++            self.last_record = record
++            for s, path in zip(live, paths):
++                s.pend = (record, path)
+         for k, (s, tokens, (path, end)) in enumerate(zip(live, wins, kept_rows)):
+             new = [tokens[r] for r in path[1:]] + [end]
+             s.committed.extend(tokens[r] for r in path)
+@@ -286,6 +292,7 @@ class MultiDecoder:
+ 
+         g, d = self.graphs, s.snap
+         depth, conf, before = policy_for(1, self.depth, self.confidence)
++        self._flush([s])
+         if self.resident is not s:
+             s.st, d.cache = g.load(s.st, d.cache, min(g.capacity, len(s.prompt) + s.count + COPY_ROWS))
+             self.resident = s
+@@ -303,6 +310,35 @@ class MultiDecoder:
+         s.take(new, self._ends(s))
+         return [s] if s.done else []
+ 
++    @staticmethod
++    def _flush(streams) -> None:
++        """Step the streams' deferred rows into their states now (one replay launch a record)."""
++
++        by: dict[int, tuple] = {}
++        for s in streams:
++            p = getattr(s, "pend", None)
++            if p is not None:
++                group = by.setdefault(id(p[0]), (p[0], [], []))
++                group[1].append(s.st)
++                group[2].append(p[1])
++                s.pend = None
++        for record, states, rows in by.values():
++            replay_pending(states, record, rows)
++
++    def _pending(self, live: list[Stream]):
++        """(record, rows a stream) for ``multi_tree_forward``: the deferred rows of the last forward's record; a stream
++        holding an older record's rows (none in steady state) is stepped eagerly first."""
++
++        last = getattr(self, "last_record", None)
++        self._flush([s for s in live if getattr(s, "pend", None) is not None and s.pend[0] is not last])
++        if not any(getattr(s, "pend", None) is not None for s in live):
++            return None
++        rows = []
++        for s in live:
++            rows.append(s.pend[1] if getattr(s, "pend", None) is not None else [])
++            s.pend = None                             # the forward steps them
++        return last, rows
++
+     def _propose(self, live: list[Stream]) -> None:
+         """Every drafting stream's carry absorbed in one head call, then a copy or an MTP chain each, the chains stepped together."""
+ 
+-- 
+2.43.0
+

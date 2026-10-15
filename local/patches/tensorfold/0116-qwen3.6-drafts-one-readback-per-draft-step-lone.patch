@@ -1,0 +1,87 @@
+From 6883c7e542af1f679839d8c529a02e50af332bcd Mon Sep 17 00:00:00 2001
+From: quietvidarr <343052645+quietvidarr@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 09:19:36 +0200
+Subject: [PATCH] 0003-qwen3.6-drafts-one-readback-per-draft-step-lone-stre
+
+---
+ .../families/qwen3_5_moe/cuda/decode.py       | 45 +++++++++++++------
+ 1 file changed, 31 insertions(+), 14 deletions(-)
+
+diff --git a/src/tensorfold/families/qwen3_5_moe/cuda/decode.py b/src/tensorfold/families/qwen3_5_moe/cuda/decode.py
+index 5f4e01b..363f672 100644
+--- a/src/tensorfold/families/qwen3_5_moe/cuda/decode.py
++++ b/src/tensorfold/families/qwen3_5_moe/cuda/decode.py
+@@ -40,21 +40,25 @@ class Result:
+ 
+ def draft(logits: torch.Tensor, position: int, sampling: Sampling | None,
+           ids: torch.Tensor | None = None) -> tuple[int, float]:
+-    """The head's guess for ``position`` by the target's own keyed rule, and its temperature-1 probability."""
++    """The head's guess for ``position`` by the target's own keyed rule, and its temperature-1 probability (one readback)."""
+ 
+     row = logits.float()[0]
+     if COALESCE:
+         return _draft_one(row, position, sampling, ids)
++    probs = torch.softmax(row, -1)
+     if sampling is None or sampling.temperature <= 0:
+-        pick = int(row.argmax().item())
+-    else:
+-        k = min(row.shape[0], int(sampling.top_k) + MARGIN) if sampling.top_k else row.shape[0]
+-        values, cols = torch.topk(row, k)
+-        tokens = (ids[cols] if ids is not None else cols).cpu().numpy().astype(np.int64)
+-        chosen = choose_rows(values.cpu().numpy()[None], tokens[None], [position], sampling)[0]
+-        pick = int(cols[int(np.nonzero(tokens == chosen)[0][0])].item())
+-    token = int(ids[pick].item()) if ids is not None else pick
+-    return token, float(torch.softmax(row, -1)[pick].item())
++        pick = row.argmax()
++        token = ids[pick] if ids is not None else pick
++        got = torch.stack([token.double(), probs[pick].double()]).cpu()     # exact: ids < 2**53, fp32 in fp64
++        return int(got[0]), float(got[1])
++    k = min(row.shape[0], int(sampling.top_k) + MARGIN) if sampling.top_k else row.shape[0]
++    values, cols = torch.topk(row, k)
++    tokens = ids[cols] if ids is not None else cols
++    got = torch.cat([values.double(), tokens.double(), probs[cols].double()]).cpu().numpy()
++    tokens_np = got[k:2 * k].astype(np.int64)
++    chosen = choose_rows(got[:k].astype(np.float32)[None], tokens_np[None], [position], sampling)[0]
++    at = int(np.nonzero(tokens_np == chosen)[0][0])
++    return int(chosen), float(np.float32(got[2 * k + at]))
+ 
+ 
+ _HOST_IDS: dict = {}
+@@ -111,17 +115,30 @@ def picks(logits: torch.Tensor, positions: Sequence[int], samplings: Sequence[Sa
+         mine = probs if len(members) == len(samplings) else probs[members]
+         launched.append((members, values, cols, mine.gather(1, cols)))
+     out: list[tuple[int, float]] = [(0, 0.0)] * len(samplings)
++    # every group's columns, probabilities and values in one readback (exact in fp64: fp32 values, ids < 2**53)
++    parts = [t.double().reshape(-1) for _, values, cols, p in launched for t in ((cols, p) if values is None
++                                                                                 else (cols, p, values))]
++    flat = (torch.cat(parts) if len(parts) > 1 else parts[0]).cpu().numpy()
++    cursor = [0]
++
++    def take(shape):
++        n = shape[0] * shape[1]
++        got = flat[cursor[0]:cursor[0] + n].reshape(shape)
++        cursor[0] += n
++        return got
++
+     for members, values, cols, p in launched:
+-        cols, p = cols.cpu().numpy(), p.cpu().numpy()
+-        values = values.cpu().numpy() if values is not None else None
++        shape = tuple(cols.shape)
++        cols, p = take(shape).astype(np.int64), take(shape).astype(np.float32)
++        values = take(shape).astype(np.float32) if values is not None else None
+         for j, i in enumerate(members):
+             tokens = (ids[cols[j]] if ids is not None else cols[j]).astype(np.int64)
+             if values is None:
+                 out[i] = int(tokens[0]), float(p[j, 0])
+                 continue
+             chosen = choose_rows(values[j][None], tokens[None], [positions[i]], samplings[i])[0]
+-            at = int(np.nonzero(tokens == chosen)[0][0])
+-            out[i] = int(chosen), float(p[j, at])
++            hit = int(np.nonzero(tokens == chosen)[0][0])
++            out[i] = int(chosen), float(p[j, hit])
+     return out
+ 
+ 
+-- 
+2.43.0
+
