@@ -5,7 +5,7 @@ No upstream recipe. Built on:
 | What | From | Pinned in |
 |---|---|---|
 | Image `qwen38-flash-next-tensorfold:609ca419` | Flash recipe (souf's `scripts/build_tensorfold.sh`) | `local/pins.env` `BASE_IMAGE`, `TENSORFOLD_REV` |
-| TensorFold source | [quietvidarr/TensorFold-spark@f92a45ee](https://github.com/quietvidarr/TensorFold-spark/commit/f92a45ee049ab627d0d3260443a63010d3221ea7) (both models; same commit as the Flash recipe) | `local/pins.env` `TENSORFOLD_FORK_REV` |
+| TensorFold source | [quietvidarr/TensorFold-spark@4877e2ad](https://github.com/quietvidarr/TensorFold-spark/commit/4877e2adf4b49bf6f5118d992618e68df8866a3c) (both models; same commit as the Flash recipe) | `local/pins.env` `TENSORFOLD_FORK_REV` |
 | Weights | `yeasah/Qwen3.6-35B-A3B-exl3` `6.00bpw` | `local/pins.env`, `local/manifest.json` |
 
 ## Update
@@ -36,7 +36,7 @@ Incompatible: fix the fork (`spark`), pin the commit in both recipes, re-check.
 
 ## TensorFold changes
 
-TensorFold changes live in [quietvidarr/TensorFold-spark@f92a45ee](https://github.com/quietvidarr/TensorFold-spark/commit/f92a45ee049ab627d0d3260443a63010d3221ea7). Numbers = the former patch files; details in its `CHANGES.md`.
+TensorFold changes live in [quietvidarr/TensorFold-spark@4877e2ad](https://github.com/quietvidarr/TensorFold-spark/commit/4877e2adf4b49bf6f5118d992618e68df8866a3c). Numbers = the former patch files; details in its `CHANGES.md`.
 
 | # | Change |
 |---|---|
